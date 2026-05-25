@@ -15,6 +15,7 @@ from collections import Counter
 import os
 from pathlib import Path
 import json
+from sqlalchemy import text
 
 app = FastAPI()
 
@@ -213,7 +214,70 @@ def analyze_compression_artifacts(image: Image.Image) -> dict:
             }
     except Exception as e:
         return {"error": str(e)}
+import hashlib
+import io
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
+from PIL import Image
+import imagehash
 
+from database import get_db, engine, Base
+from models import OriginalAsset
+
+# Dynamically ensure tables are built (if they don't already exist)
+Base.metadata.create_all(bind=engine)
+
+@app.post("/upload-asset/", status_code=status.HTTP_201_CREATED)
+async def upload_original_asset(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    # 1. Read the raw incoming file data into memory
+    file_bytes = await file.read()
+    
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    try:
+        # 2. Compute Strict Cryptographic Signature (SHA-256)
+        sha256_sig = hashlib.sha256(file_bytes).hexdigest()
+
+        # 3. Compute Visual Perceptual Hash (pHash)
+        image = Image.open(io.BytesIO(file_bytes))
+        calculated_phash = str(imagehash.phash(image)) # Produces a 16-character hex string
+
+        # 4. Bind information to our database record
+        new_asset = OriginalAsset(
+            file_name=file.filename,
+            file_data=file_bytes, # Storing binary payload directly
+            phash=calculated_phash,
+            sha256_hash=sha256_sig
+        )
+
+        db.add(new_asset)
+        db.commit()
+        db.refresh(new_asset)
+
+        return {
+            "message": "Asset safely stored in Neon DB",
+            "id": str(new_asset.id),
+            "file_name": new_asset.file_name,
+            "phash": new_asset.phash,
+            "sha256": new_asset.sha256_hash
+        }
+
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to process image asset: {str(e)}")
+
+
+@app.get("/view-asset/{asset_id}")
+def get_asset_image(asset_id: str, db: Session = Depends(get_db)):
+    # Helper route so your React frontend can visually load the binary image string
+    asset = db.query(OriginalAsset).filter(OriginalAsset.id == asset_id).first()
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset metadata reference not found.")
+    
+    # Stream binary data directly back out as a standard displayable JPEG/PNG
+    return StreamingResponse(io.BytesIO(asset.file_data), media_type="image/jpeg")
 
 def check_for_duplicates(image: Image.Image, filename: str) -> dict:
     """
@@ -313,42 +377,100 @@ def detect_manipulation_indicators(edit_data: dict, image_data: dict) -> list:
 
     return indicators
 
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(exist_ok=True)
 
 @app.post("/upload")
 async def upload_evidence(
-    files: List[UploadFile] = File(...),
-    case_id: str = Form(None)
+    file: UploadFile = File(...),
+    case_id: str = Form(None),
+    submitter_metadata: str = Form(None),
+    db: Session = Depends(get_db)
 ):
     """
     Upload evidence files and generate forensic analysis for cyberbullying cases.
-    Specialized for screenshot forensics: edit detection, duplicate detection, and timeline analysis.
+    Specialized for screenshot forensics: visual similarity matching, edit detection,
+    and cryptographic integrity checking using Approach A.
     """
     results = []
 
+    # Parse submitter metadata if provided
+    metadata = {}
+    if submitter_metadata:
+        try:
+            metadata = json.loads(submitter_metadata)
+        except json.JSONDecodeError:
+            print("Invalid JSON in submitter_metadata")
+
+    # Process single file
+    files = [file]  # Wrap in list for consistent processing
+
     for file in files:
-        # Read file content
+        # Read file content into memory
         file_content = await file.read()
+        if not file_content:
+            continue
 
-        # Calculate SHA-256 hash for file integrity
+        # Calculate SHA-256 hash for strict file integrity matching
         sha256_hash = hashlib.sha256(file_content).hexdigest()
-
-        # Generate unique file ID
         file_id = str(uuid.uuid4())
 
-        # Save file to disk
+        # Keep your local disk save step for now (as a temporary backup)
         file_extension = Path(file.filename).suffix
         saved_filename = f"{file_id}{file_extension}"
         file_path = UPLOAD_DIR / saved_filename
-
         with open(file_path, "wb") as f:
             f.write(file_content)
 
-        # Perform forensic analysis for images
+        # Initialize core verification status variables
+        verification_status = "UNKNOWN_ASSET"
+        matched_asset_info = None
         forensic_data = {}
-        if file.content_type and file.content_type.startswith('image/'):
-            forensic_data = analyze_screenshot_forensics(file_content, file.filename)
 
-        # Create result for each file
+        # Perform visual similarity search if the uploaded file is an image
+        if file.content_type and file.content_type.startswith('image/'):
+            try:
+                # 2. Compute the Visual Perceptual Hash (pHash) in memory
+                image = Image.open(io.BytesIO(file_content))
+                computed_phash = str(imagehash.phash(image))
+
+                # 3. NEON DB QUERY: Search original assets for close visual matches using Postgres bitwise XOR (#)
+                search_query = text("""
+                    SELECT id, file_name, phash, sha256_hash 
+                    FROM original_assets
+                    WHERE BIT_COUNT(('x' || phash)::bit(64) # ('x' || :query_phash)::bit(64)) <= 10
+                    ORDER BY BIT_COUNT(('x' || phash)::bit(64) # ('x' || :query_phash)::bit(64)) ASC
+                    LIMIT 1;
+                """)
+                
+                # Execute the native query against your Neon instance
+                match = db.execute(search_query, {"query_phash": computed_phash}).fetchone()
+
+                if match:
+                    # Map out matching asset metadata retrieved from Neon
+                    matched_asset_info = {
+                        "original_asset_id": str(match.id),
+                        "original_filename": match.file_name,
+                        "original_sha256": match.sha256_hash
+                    }
+
+                    # 4. CROSS-REFERENCE INTEGRITY: Check if the hashes match bit-by-bit
+                    if sha256_hash == match.sha256_hash:
+                        verification_status = "VERIFIED_AUTHENTIC"
+                    else:
+                        verification_status = "TAMPERED_MANIPULATED"
+                else:
+                    verification_status = "UNREGISTERED_ASSET"
+
+                # Run your existing screenshot forensics pipeline
+                # (Passing file_content or updating your method internally)
+                forensic_data = analyze_screenshot_forensics(file_content, file.filename)
+                
+            except Exception as img_err:
+                print(f"Error processing visual forensics for {file.filename}: {img_err}")
+                verification_status = "PROCESSING_ERROR"
+
+        # Create comprehensive result payload for each file
         file_result = {
             "file_id": file_id,
             "filename": file.filename,
@@ -359,13 +481,16 @@ async def upload_evidence(
             "sha256_hash": sha256_hash,
             "case_id": case_id,
             "uploaded_at": datetime.now().isoformat(),
-            "forensics": forensic_data
+            "verification_status": verification_status,  # AUTHENTIC, TAMPERED, or UNREGISTERED
+            "matched_asset": matched_asset_info,          # Details of the original file it matched with
+            "forensics": forensic_data,
+            "submitter_metadata": metadata  
         }
 
         results.append(file_result)
 
     return {
         "success": True,
-        "message": f"Successfully processed {len(results)} file(s)",
+        "message": f"Successfully evaluated {len(results)} file(s) against secure ledger.",
         "files": results
     }
