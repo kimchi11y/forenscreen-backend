@@ -155,10 +155,33 @@ def analyze_color_distribution(image: Image.Image) -> dict:
         return {"error": str(e)}
 
 
+# ELA thresholds are expressed as a PERCENTAGE of the maximum possible pixel
+# difference (0-255), not as a raw 0-100 score. The raw `stat.mean` diff used
+# below ranges 0-255, so it must be normalized before being compared against
+# a 0-100 scale or displayed as "X/100" - treating the raw value as already
+# being 0-100 was the root cause of ELA scores/likelihoods looking wrong
+# (nearly everything read as "High").
+#
+# These thresholds are still heuristic defaults and should be recalibrated
+# against a labeled set of known-authentic vs. known-tampered images before
+# being relied on for a real verdict (see FYP objective: "evaluate the
+# accuracy of manipulation detection").
+ELA_THRESHOLD_HIGH_PCT = 20.0   # % of max possible pixel error
+ELA_THRESHOLD_MEDIUM_PCT = 10.0
+
 def perform_error_level_analysis(image: Image.Image, quality: int = 90) -> dict:
     """
     Perform Error Level Analysis to detect edited regions.
     Edited areas often have different compression artifacts.
+
+    Note: ELA is designed to catch *local* recompression mismatches within an
+    image that already has a JPEG compression history (i.e. edited regions
+    were saved at a different quality than the rest of the image). For
+    lossless sources (e.g. PNG screenshots) there is no original JPEG quality
+    to diff against, so a single fixed recompression pass will produce
+    elevated, roughly uniform error across the whole image (especially at
+    sharp text/UI edges) regardless of tampering. Treat this score as a
+    supporting signal, not a standalone verdict.
     """
     try:
         # Convert to RGB if necessary
@@ -174,23 +197,41 @@ def perform_error_level_analysis(image: Image.Image, quality: int = 90) -> dict:
         # Calculate difference
         diff = ImageChops.difference(image, compressed)
 
-        # Get statistics
+        # Get statistics. Raw mean pixel difference is on a 0-255 scale.
         stat = ImageStat.Stat(diff)
-        ela_score = round(sum(stat.mean) / len(stat.mean), 2)
-        ela_variance = round(sum(stat.variance) / len(stat.variance), 2)
+        ela_score_raw = round(sum(stat.mean) / len(stat.mean), 2)
+        # NOTE: Pillow's ImageStat.Stat exposes variance as `.var`, not
+        # `.variance`. The old `.variance` attribute reference raised an
+        # AttributeError on every call, which was silently swallowed by the
+        # except block below - meaning ELA was never actually computing
+        # successfully in production and always fell back to
+        # {"edit_likelihood": "Unknown"}. This was the primary cause of the
+        # ELA numbers looking wrong.
+        ela_variance = round(sum(stat.var) / len(stat.var), 2)
 
-        # Determine if editing likely occurred
+        # Normalize to a proper 0-100 scale for display/comparison.
+        ela_score_normalized = round((ela_score_raw / 255) * 100, 2)
+
+        # Determine if editing likely occurred, using the normalized score
+        # against percentage-based thresholds.
         edit_likelihood = "Low"
-        if ela_score > 15:
+        if ela_score_normalized > ELA_THRESHOLD_HIGH_PCT:
             edit_likelihood = "High"
-        elif ela_score > 8:
+        elif ela_score_normalized > ELA_THRESHOLD_MEDIUM_PCT:
             edit_likelihood = "Medium"
 
         return {
-            "ela_score": ela_score,
+            # Raw 0-255 mean pixel error (kept for debugging/back-compat).
+            "ela_score": ela_score_raw,
+            # Correctly-scaled 0-100 score - use this for display/thresholds.
+            "ela_score_normalized": ela_score_normalized,
             "ela_variance": ela_variance,
             "edit_likelihood": edit_likelihood,
-            "interpretation": f"Score {ela_score}/100 - {edit_likelihood} likelihood of manipulation"
+            "interpretation": (
+                f"Score {ela_score_normalized}/100 (normalized) - "
+                f"{edit_likelihood} likelihood of manipulation. "
+                f"Supporting signal only - not the sole basis for a tamper verdict."
+            )
         }
     except Exception as e:
         return {"error": str(e), "edit_likelihood": "Unknown"}
@@ -352,10 +393,12 @@ def detect_manipulation_indicators(edit_data: dict, image_data: dict) -> list:
     """Generate human-readable manipulation indicators."""
     indicators = []
 
-    # ELA-based indicators
-    if edit_data.get("ela_score", 0) > 15:
+    # ELA-based indicators (use the normalized 0-100 score, not the raw
+    # 0-255 value - see perform_error_level_analysis for why this matters).
+    ela_score_normalized = edit_data.get("ela_score_normalized", 0)
+    if ela_score_normalized > ELA_THRESHOLD_HIGH_PCT:
         indicators.append("⚠️ High ELA score suggests possible image editing")
-    elif edit_data.get("ela_score", 0) > 8:
+    elif ela_score_normalized > ELA_THRESHOLD_MEDIUM_PCT:
         indicators.append("⚡ Medium ELA score - minor modifications possible")
 
     # Color-based indicators
@@ -380,11 +423,28 @@ def detect_manipulation_indicators(edit_data: dict, image_data: dict) -> list:
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
+# How close two pHash values (in bits, out of 64) must be to be considered
+# the same underlying image.
+PHASH_MATCH_THRESHOLD = 10
+# If the #2 candidate is within this many bits of the #1 candidate, the match
+# is ambiguous (could plausibly be either original) and must not be silently
+# resolved by picking the numerically-closest one. This is what caused two
+# registered originals (A and C) to be confused with each other when
+# verifying a tampered derivative of A.
+PHASH_AMBIGUITY_MARGIN = 4
+
+
 @app.post("/upload")
 async def upload_evidence(
     file: UploadFile = File(...),
     case_id: str = Form(None),
     submitter_metadata: str = Form(None),
+    # Optional explicit scoping: if the caller already knows which registered
+    # original this evidence should be verified against (e.g. selected from
+    # a case's asset list in the UI), pass its id here to bypass the
+    # database-wide nearest-neighbor search entirely. This is the most
+    # reliable fix for ambiguous pHash matches - prefer it when available.
+    original_asset_id: str = Form(None),
     db: Session = Depends(get_db)
 ):
     """
@@ -434,19 +494,68 @@ async def upload_evidence(
                 image = Image.open(io.BytesIO(file_content))
                 computed_phash = str(imagehash.phash(image))
 
-                # 3. NEON DB QUERY: Search original assets for close visual matches using Postgres bitwise XOR (#)
-                search_query = text("""
-                    SELECT id, file_name, phash, sha256_hash 
-                    FROM original_assets
-                    WHERE BIT_COUNT(('x' || phash)::bit(64) # ('x' || :query_phash)::bit(64)) <= 10
-                    ORDER BY BIT_COUNT(('x' || phash)::bit(64) # ('x' || :query_phash)::bit(64)) ASC
-                    LIMIT 1;
-                """)
-                
-                # Execute the native query against your Neon instance
-                match = db.execute(search_query, {"query_phash": computed_phash}).fetchone()
+                match = None
+                ambiguous_candidates = None
 
-                if match:
+                if original_asset_id:
+                    # Explicit scoping requested: verify against this exact
+                    # registered original only, no similarity search needed.
+                    scoped_query = text("""
+                        SELECT id, file_name, phash, sha256_hash
+                        FROM original_assets
+                        WHERE id = :asset_id;
+                    """)
+                    match = db.execute(scoped_query, {"asset_id": original_asset_id}).fetchone()
+                else:
+                    # 3. NEON DB QUERY: Search original assets for close visual matches
+                    # using Postgres bitwise XOR (#). We fetch the top 2 candidates
+                    # (not just 1) so we can detect ambiguous matches instead of
+                    # blindly trusting whichever one happens to be numerically
+                    # closest - two unrelated registered originals (e.g. two
+                    # similar-looking screenshots) can easily land within a few
+                    # bits of each other in pHash space.
+                    search_query = text("""
+                        SELECT id, file_name, phash, sha256_hash,
+                               BIT_COUNT(('x' || phash)::bit(64) # ('x' || :query_phash)::bit(64)) AS distance
+                        FROM original_assets
+                        WHERE BIT_COUNT(('x' || phash)::bit(64) # ('x' || :query_phash)::bit(64)) <= :threshold
+                        ORDER BY distance ASC
+                        LIMIT 2;
+                    """)
+
+                    candidates = db.execute(
+                        search_query,
+                        {"query_phash": computed_phash, "threshold": PHASH_MATCH_THRESHOLD}
+                    ).fetchall()
+
+                    if len(candidates) >= 2:
+                        best, runner_up = candidates[0], candidates[1]
+                        if (runner_up.distance - best.distance) < PHASH_AMBIGUITY_MARGIN:
+                            ambiguous_candidates = [
+                                {
+                                    "original_asset_id": str(c.id),
+                                    "original_filename": c.file_name,
+                                    "original_sha256": c.sha256_hash,
+                                    "phash_distance": c.distance,
+                                }
+                                for c in candidates
+                            ]
+                        else:
+                            match = best
+                    elif len(candidates) == 1:
+                        match = candidates[0]
+
+                if ambiguous_candidates:
+                    verification_status = "AMBIGUOUS_MATCH"
+                    matched_asset_info = {
+                        "candidates": ambiguous_candidates,
+                        "message": (
+                            "Multiple registered originals are visually similar enough "
+                            "that this evidence cannot be reliably matched automatically. "
+                            "Re-verify against a specific original_asset_id."
+                        )
+                    }
+                elif match:
                     # Map out matching asset metadata retrieved from Neon
                     matched_asset_info = {
                         "original_asset_id": str(match.id),
