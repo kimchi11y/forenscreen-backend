@@ -1390,6 +1390,89 @@ def verify_anchor(sha256: str, db: Session = Depends(get_db)):
     }
 
 
+@app.post("/checks/{check_id}/report")
+def export_check_report(
+    check_id: str,
+    user: dict | None = Depends(auth.optional_user),
+    db: Session = Depends(get_db),
+):
+    """Produce a report for one check, and record that it was exported.
+
+    Exporting is itself a custody event: a copy leaving the system is exactly
+    the kind of thing a chain of custody exists to record. The report embeds the
+    custody chain and its verification result, so the document carries its own
+    evidence of completeness instead of asserting it.
+    """
+    try:
+        uuid.UUID(check_id)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid check id.")
+
+    row = db.execute(
+        text("""
+            SELECT c.id, c.asset_id, c.sha256_hash, c.phash, c.verdict,
+                   c.match_method, c.orb_inliers, c.orb_inlier_ratio,
+                   c.phash_distance, c.saved_filename, c.created_at,
+                   a.file_name AS asset_name, a.sha256_hash AS asset_sha256
+            FROM evidence_checks c
+            LEFT JOIN original_assets a ON a.id = c.asset_id
+            WHERE c.id = :id
+        """),
+        {"id": check_id},
+    ).fetchone()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="Check not found.")
+
+    entries = custody.list_entries(db, custody.SUBJECT_EVIDENCE, check_id)
+    chain = custody.verify_chain(entries)
+
+    custody.append_entry(
+        db,
+        subject_type=custody.SUBJECT_EVIDENCE,
+        subject_id=uuid.UUID(check_id),
+        event_type=custody.REPORT_EXPORTED,
+        actor=auth.actor_from(user),
+        payload={
+            "verdict": row.verdict,
+            "custody_entries": len(entries),
+            "chain_head": chain.get("head_hash"),
+        },
+    )
+    db.commit()
+
+    return {
+        "report": {
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "generated_by": auth.actor_from(user),
+            "check": {
+                "id": str(row.id),
+                "sha256": row.sha256_hash,
+                "phash": row.phash,
+                "verdict": row.verdict,
+                "match_method": row.match_method,
+                "orb_inliers": row.orb_inliers,
+                "orb_inlier_ratio": (
+                    float(row.orb_inlier_ratio) if row.orb_inlier_ratio is not None else None
+                ),
+                "phash_distance": row.phash_distance,
+                "saved_filename": row.saved_filename,
+                "checked_at": row.created_at.isoformat() if row.created_at else None,
+                "matched_asset": (
+                    {
+                        "id": str(row.asset_id),
+                        "file_name": row.asset_name,
+                        "sha256": row.asset_sha256,
+                    }
+                    if row.asset_id
+                    else None
+                ),
+            },
+            "custody": {"chain": chain, "entries": entries},
+        }
+    }
+
+
 @app.get("/checks/{check_id}")
 def get_check(check_id: str, db: Session = Depends(get_db)):
     """A stored comparison, so a result survives a page reload."""
