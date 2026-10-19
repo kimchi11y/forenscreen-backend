@@ -271,7 +271,7 @@ import blockchain
 import custody
 import matching
 from database import SessionLocal, ensure_schema, get_db
-from models import EvidenceCheck, OriginalAsset
+from models import CustodyEntry, EvidenceCheck, OriginalAsset
 
 # Pillow does not decode HEIC/HEIF files unless this plugin is registered.
 register_heif_opener()
@@ -1145,10 +1145,79 @@ def _validate_subject(subject_type: str, subject_id: str):
         raise HTTPException(status_code=400, detail="Invalid subject id.")
 
 
+def _reconcile_pending_anchors(db, subject_type: str, subject_id: str) -> bool:
+    """Confirm an anchor that is still marked pending, if the chain has mined it.
+
+    A Sepolia block takes about 12 seconds, so the receipt is essentially never
+    available at the moment registration returns - the entry is written as
+    `pending` and the receipt has to come from somewhere later.
+
+    Rather than run a background poller, the receipt is picked up the first time
+    anyone looks. That keeps the record self-healing with no extra process, and
+    it is why reading a custody log can write: appending the confirmation entry
+    is the correct way to record it, since the original entry is immutable.
+    """
+    pending = db.execute(
+        text("""
+            SELECT id, anchor_tx_hash
+            FROM custody_entries
+            WHERE subject_type = :subject_type
+              AND subject_id = :subject_id
+              AND anchor_status = 'pending'
+              AND anchor_tx_hash IS NOT NULL
+            ORDER BY seq DESC
+            LIMIT 1
+        """),
+        {"subject_type": subject_type, "subject_id": str(subject_id)},
+    ).fetchone()
+
+    if pending is None:
+        return False
+
+    result = blockchain.confirm(pending.anchor_tx_hash)
+    if result.get("status") != "confirmed":
+        return False
+
+    entry = db.get(CustodyEntry, pending.id)
+    if entry is not None:
+        # The only columns a trigger allows to change after insert.
+        entry.anchor_status = "confirmed"
+        entry.anchor_block = result.get("block_number")
+
+    custody.append_entry(
+        db,
+        subject_type=subject_type,
+        subject_id=subject_id,
+        event_type=custody.ANCHOR_CONFIRMED,
+        payload={
+            "tx_hash": pending.anchor_tx_hash,
+            "block_number": result.get("block_number"),
+            "reconciled_on_read": True,
+        },
+        anchor={
+            "tx_hash": pending.anchor_tx_hash,
+            "block_number": result.get("block_number"),
+            "status": "confirmed",
+        },
+    )
+    db.commit()
+    return True
+
+
 @app.get("/custody/{subject_type}/{subject_id}")
 def get_custody(subject_type: str, subject_id: str, db: Session = Depends(get_db)):
     """The full handling history of one asset or one piece of evidence."""
     _validate_subject(subject_type, subject_id)
+
+    # A pending anchor may have been mined since it was written. Reconcile
+    # before reading so the returned record is current; a reconciliation
+    # failure must not stop the log from being returned.
+    try:
+        _reconcile_pending_anchors(db, subject_type, subject_id)
+    except Exception as exc:
+        db.rollback()
+        print(f"Anchor reconciliation failed for {subject_id}: {exc}")
+
     entries = custody.list_entries(db, subject_type, subject_id)
     return {
         "subject_type": subject_type,
