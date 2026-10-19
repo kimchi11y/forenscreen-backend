@@ -7,10 +7,12 @@ from datetime import datetime
 import uuid
 from typing import List, Dict
 from PIL import Image, ImageChops, ImageStat
+from PIL import UnidentifiedImageError
 from PIL.ExifTags import TAGS, GPSTAGS
 import io
 import imagehash
 import numpy as np
+from pillow_heif import register_heif_opener
 from collections import Counter
 import os
 from pathlib import Path
@@ -266,6 +268,9 @@ import imagehash
 from database import get_db, engine, Base
 from models import OriginalAsset
 
+# Pillow does not decode HEIC/HEIF files unless this plugin is registered.
+register_heif_opener()
+
 # Dynamically ensure tables are built (if they don't already exist)
 Base.metadata.create_all(bind=engine)
 
@@ -278,12 +283,19 @@ async def upload_original_asset(file: UploadFile = File(...), db: Session = Depe
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
     try:
-        # 2. Compute Strict Cryptographic Signature (SHA-256)
-        sha256_sig = hashlib.sha256(file_bytes).hexdigest()
-
-        # 3. Compute Visual Perceptual Hash (pHash)
+        # 2. Decode before opening a database transaction so bad input is a 400.
         image = Image.open(io.BytesIO(file_bytes))
+        image.load()
         calculated_phash = str(imagehash.phash(image)) # Produces a 16-character hex string
+    except (UnidentifiedImageError, OSError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded file is not a supported image (PNG, JPEG, or HEIC/HEIF).",
+        ) from exc
+
+    try:
+        # 3. Compute Strict Cryptographic Signature (SHA-256)
+        sha256_sig = hashlib.sha256(file_bytes).hexdigest()
 
         # 4. Bind information to our database record
         new_asset = OriginalAsset(
