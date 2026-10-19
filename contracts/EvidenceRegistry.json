@@ -1,0 +1,98 @@
+{
+  "abi": [
+    {
+      "inputs": [
+        {
+          "internalType": "bytes32",
+          "name": "digest",
+          "type": "bytes32"
+        }
+      ],
+      "name": "AlreadyAnchored",
+      "type": "error"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "bytes32",
+          "name": "digest",
+          "type": "bytes32"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "submittedBy",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint64",
+          "name": "timestamp",
+          "type": "uint64"
+        }
+      ],
+      "name": "Anchored",
+      "type": "event"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes32",
+          "name": "digest",
+          "type": "bytes32"
+        }
+      ],
+      "name": "anchor",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes32",
+          "name": "digest",
+          "type": "bytes32"
+        }
+      ],
+      "name": "isAnchored",
+      "outputs": [
+        {
+          "internalType": "bool",
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes32",
+          "name": "digest",
+          "type": "bytes32"
+        }
+      ],
+      "name": "verify",
+      "outputs": [
+        {
+          "internalType": "uint64",
+          "name": "timestamp",
+          "type": "uint64"
+        },
+        {
+          "internalType": "address",
+          "name": "submittedBy",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    }
+  ],
+  "bytecode": "608060405234801561000f575f80fd5b506102298061001d5f395ff3fe608060405234801561000f575f80fd5b506004361061003f575f3560e01c80634f0b58011461004357806375e3661614610083578063eecdf927146100fa575b5f80fd5b61006e6100513660046101dc565b5f9081526020819052604090205467ffffffffffffffff16151590565b60405190151581526020015b60405180910390f35b6100d26100913660046101dc565b5f908152602081815260409182902082518084019093525467ffffffffffffffff8116808452600160401b9091046001600160a01b03169290910182905291565b6040805167ffffffffffffffff90931683526001600160a01b0390911660208301520161007a565b61010d6101083660046101dc565b61010f565b005b5f8181526020819052604090205467ffffffffffffffff161561014c576040516330d2381360e01b81526004810182905260240160405180910390fd5b60408051808201825267ffffffffffffffff4281168083523360208085018281525f8881528083528790209551865491516001600160a01b0316600160401b026001600160e01b0319909216951694909417939093179093559251928352909183917f0733e5a0823eaea6686da77c223c685bd0c96ab61f1323c5ab21d5ecc786f53a910160405180910390a350565b5f602082840312156101ec575f80fd5b503591905056fea2646970667358221220473340febf22330b290795f7021a9755a0c9c2b489634f9916ec2114abb2c5f264736f6c63430008180033",
+  "solc": "0.8.24"
+}

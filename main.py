@@ -259,7 +259,7 @@ def analyze_compression_artifacts(image: Image.Image) -> dict:
         return {"error": str(e)}
 import hashlib
 import io
-from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status
+from fastapi import BackgroundTasks, FastAPI, UploadFile, File, Depends, HTTPException, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.exc import IntegrityError
@@ -267,9 +267,10 @@ from sqlalchemy.orm import Session
 from PIL import Image
 import imagehash
 
+import blockchain
 import custody
 import matching
-from database import get_db, ensure_schema
+from database import SessionLocal, ensure_schema, get_db
 from models import EvidenceCheck, OriginalAsset
 
 # Pillow does not decode HEIC/HEIF files unless this plugin is registered.
@@ -280,7 +281,11 @@ register_heif_opener()
 ensure_schema()
 
 @app.post("/upload-asset/", status_code=status.HTTP_201_CREATED)
-async def upload_original_asset(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def upload_original_asset(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
     # 1. Read the raw incoming file data into memory
     file_bytes = await file.read()
     
@@ -355,6 +360,11 @@ async def upload_original_asset(file: UploadFile = File(...), db: Session = Depe
 
         db.commit()
         db.refresh(new_asset)
+
+        # Anchoring runs after the response is returned. A Sepolia block takes
+        # roughly 12 seconds and the network can be down; neither is a reason to
+        # make someone wait to save evidence, or to fail their registration.
+        background_tasks.add_task(_anchor_asset, str(new_asset.id), sha256_sig)
     except IntegrityError:
         # Lost a race against a concurrent registration of the same bytes. The
         # UNIQUE index on sha256_hash is the source of truth, so return theirs.
@@ -826,6 +836,122 @@ async def upload_evidence(
         "message": f"Successfully evaluated {len(results)} file(s) against secure ledger.",
         "files": results
     }
+
+
+# ---------------------------------------------------------------------------
+# On-chain anchoring
+# ---------------------------------------------------------------------------
+
+def _anchor_asset(asset_id: str, sha256_hex: str) -> dict:
+    """Submit an anchor for an asset and record the outcome in its custody log.
+
+    Opens its own session, because this also runs as a background task - by then
+    the request's session has been closed.
+    """
+    result = blockchain.anchor(sha256_hex)
+    outcome = result.get("status")
+    subject_id = uuid.UUID(asset_id)
+
+    session = SessionLocal()
+    try:
+        if outcome == "pending":
+            entry = custody.append_entry(
+                session,
+                subject_type=custody.SUBJECT_ASSET,
+                subject_id=subject_id,
+                event_type=custody.ANCHOR_REQUESTED,
+                payload={"sha256": sha256_hex, "tx_hash": result.get("tx_hash")},
+                anchor={"tx_hash": result.get("tx_hash"), "status": "pending"},
+            )
+            session.commit()
+
+            # The receipt may already exist on a fast chain; on a real network it
+            # will not, and the retry endpoint picks it up later.
+            confirmed = blockchain.confirm(result["tx_hash"])
+            if confirmed.get("status") == "confirmed":
+                entry.anchor_block = confirmed.get("block_number")
+                entry.anchor_status = "confirmed"
+                custody.append_entry(
+                    session,
+                    subject_type=custody.SUBJECT_ASSET,
+                    subject_id=subject_id,
+                    event_type=custody.ANCHOR_CONFIRMED,
+                    payload={
+                        "sha256": sha256_hex,
+                        "tx_hash": result.get("tx_hash"),
+                        "block_number": confirmed.get("block_number"),
+                    },
+                    anchor={
+                        "tx_hash": result.get("tx_hash"),
+                        "block_number": confirmed.get("block_number"),
+                        "status": "confirmed",
+                    },
+                )
+                session.commit()
+                return {
+                    "status": "confirmed",
+                    "tx_hash": result.get("tx_hash"),
+                    "block_number": confirmed.get("block_number"),
+                    "explorer": confirmed.get("explorer"),
+                }
+
+        elif outcome == "confirmed":
+            custody.append_entry(
+                session,
+                subject_type=custody.SUBJECT_ASSET,
+                subject_id=subject_id,
+                event_type=custody.ANCHOR_CONFIRMED,
+                payload={
+                    "sha256": sha256_hex,
+                    "already_anchored": True,
+                    "timestamp": result.get("timestamp"),
+                },
+                anchor={"status": "confirmed"},
+            )
+            session.commit()
+            return {"status": "confirmed", "already_anchored": True}
+
+        else:  # 'skipped' when unconfigured, 'failed' when the chain refused
+            custody.append_entry(
+                session,
+                subject_type=custody.SUBJECT_ASSET,
+                subject_id=subject_id,
+                event_type=custody.ANCHOR_FAILED,
+                payload={
+                    "sha256": sha256_hex,
+                    "outcome": outcome,
+                    "reason": result.get("reason"),
+                },
+                anchor={"status": "failed"},
+            )
+            session.commit()
+            return {"status": outcome, "reason": result.get("reason")}
+    except Exception as exc:
+        session.rollback()
+        print(f"Could not record anchoring for {asset_id}: {exc}")
+        return {"status": "error", "reason": str(exc)}
+    finally:
+        session.close()
+
+    return result
+
+
+@app.post("/assets/{asset_id}/anchor")
+def anchor_asset(asset_id: str, db: Session = Depends(get_db)):
+    """Anchor an asset now, or retry an earlier failure."""
+    try:
+        uuid.UUID(asset_id)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid asset id.")
+
+    row = db.execute(
+        text("SELECT sha256_hash FROM original_assets WHERE id = :id"),
+        {"id": asset_id},
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Asset not found.")
+
+    return _anchor_asset(asset_id, row.sha256_hash)
 
 
 @app.get("/assets")
