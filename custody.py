@@ -57,6 +57,9 @@ SUBJECT_EVIDENCE = "evidence"
 
 ANONYMOUS = "unauthenticated"
 
+# Anchor events are initiated by the service itself, not by a person.
+SYSTEM_ACTOR = "system"
+
 # Human-readable labels, kept beside the vocabulary so the API and the UI cannot
 # drift apart.
 EVENT_LABELS = {
@@ -111,7 +114,7 @@ def append_entry(
     subject_id,
     event_type,
     payload=None,
-    actor=ANONYMOUS,
+    actor=None,
     anchor=None,
 ):
     """Append one entry to a subject's chain. The caller owns the transaction.
@@ -124,6 +127,13 @@ def append_entry(
         text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
         {"key": f"{subject_type}:{subject_id}"},
     )
+
+    # Anchoring is done by the service, so those events are attributed to
+    # 'system'. Everything else stays 'unauthenticated' until the caller passes
+    # a verified identity - a custody log that guesses who did something is
+    # worse than one that admits it does not know.
+    if actor is None:
+        actor = SYSTEM_ACTOR if event_type in ANCHOR_EVENTS else ANONYMOUS
 
     prev_hash = db.execute(
         text(

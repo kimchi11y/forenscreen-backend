@@ -5,6 +5,7 @@ pillow-heif>=1.1.0
 imagehash>=4.3.0
 opencv-python-headless>=4.10.0
 py-solc-x>=2.0.0
+pyjwt[crypto]>=2.9
 web3>=7.0.0
 # Verification only (scripts/verify_contract.py): uv sync --extra verify
 eth-tester[py-evm]>=0.13

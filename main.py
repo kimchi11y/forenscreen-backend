@@ -267,6 +267,7 @@ from sqlalchemy.orm import Session
 from PIL import Image
 import imagehash
 
+import auth
 import blockchain
 import custody
 import matching
@@ -284,6 +285,7 @@ ensure_schema()
 async def upload_original_asset(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
+    user: dict | None = Depends(auth.optional_user),
     db: Session = Depends(get_db),
 ):
     # 1. Read the raw incoming file data into memory
@@ -350,11 +352,13 @@ async def upload_original_asset(
             subject_type=custody.SUBJECT_ASSET,
             subject_id=new_asset.id,
             event_type=custody.ASSET_REGISTERED,
+            actor=auth.actor_from(user),
             payload={
                 "sha256": sha256_sig,
                 "phash": calculated_phash,
                 "file_name": file.filename,
                 "size_bytes": len(file_bytes),
+                "actor_email": (user or {}).get("email"),
             },
         )
 
@@ -550,6 +554,7 @@ async def upload_evidence(
     # database-wide nearest-neighbor search entirely. This is the most
     # reliable fix for ambiguous pHash matches - prefer it when available.
     original_asset_id: str = Form(None),
+    user: dict | None = Depends(auth.optional_user),
     db: Session = Depends(get_db)
 ):
     """
@@ -814,6 +819,7 @@ async def upload_evidence(
                     subject_type=custody.SUBJECT_EVIDENCE,
                     subject_id=uuid.UUID(file_id),
                     event_type=custody.CHECK_PERFORMED,
+                    actor=auth.actor_from(user),
                     payload={
                         "sha256": sha256_hash,
                         "verdict": verification_status,
@@ -1273,6 +1279,29 @@ def list_checks(limit: int = 50, offset: int = 0, db: Session = Depends(get_db))
             }
             for row in rows
         ],
+    }
+
+
+@app.get("/me")
+def whoami(user: dict | None = Depends(auth.optional_user)):
+    """Who the API believes you are.
+
+    Exists so the frontend can prove a token round-trips, and so a failure to
+    authenticate is visible as a 401 rather than as a silent downgrade to
+    anonymous.
+    """
+    if user is None:
+        return {"authenticated": False, "auth_configured": auth.is_configured()}
+
+    return {
+        "authenticated": True,
+        "actor": auth.actor_from(user),
+        "id": user.get("sub") or user.get("id"),
+        "email": user.get("email"),
+        "name": user.get("name"),
+        "email_verified": user.get("emailVerified"),
+        "role": user.get("role"),
+        "expires_at": user.get("exp"),
     }
 
 
