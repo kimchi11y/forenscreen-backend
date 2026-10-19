@@ -267,9 +267,10 @@ from sqlalchemy.orm import Session
 from PIL import Image
 import imagehash
 
+import custody
 import matching
 from database import get_db, ensure_schema
-from models import OriginalAsset
+from models import EvidenceCheck, OriginalAsset
 
 # Pillow does not decode HEIC/HEIF files unless this plugin is registered.
 register_heif_opener()
@@ -335,6 +336,23 @@ async def upload_original_asset(file: UploadFile = File(...), db: Session = Depe
 
     try:
         db.add(new_asset)
+        db.flush()
+
+        # Same transaction as the insert: an asset that exists without its
+        # registration entry would be a hole in the custody record.
+        custody.append_entry(
+            db,
+            subject_type=custody.SUBJECT_ASSET,
+            subject_id=new_asset.id,
+            event_type=custody.ASSET_REGISTERED,
+            payload={
+                "sha256": sha256_sig,
+                "phash": calculated_phash,
+                "file_name": file.filename,
+                "size_bytes": len(file_bytes),
+            },
+        )
+
         db.commit()
         db.refresh(new_asset)
     except IntegrityError:
@@ -576,6 +594,9 @@ async def upload_evidence(
             {"sha256": sha256_hash},
         ).fetchone()
 
+        # Set inside the image branch; stays None for files we cannot decode.
+        computed_phash = None
+
         if exact_hit is not None:
             verification_status = "VERIFIED_AUTHENTIC"
             matched_asset_info = {
@@ -750,6 +771,53 @@ async def upload_evidence(
             "forensics": forensic_data,
             "submitter_metadata": metadata  
         }
+
+        # Persist the check and record it in the chain of custody. A verdict that
+        # is not stored cannot be revisited, exported or audited - and you cannot
+        # log the handling of a record you do not keep.
+        #
+        # A storage failure must not invalidate a verdict the user has already
+        # been given, so it is reported in the response rather than raised.
+        file_result["persisted"] = False
+        if computed_phash is not None:
+            matched_asset_id = None
+            if isinstance(matched_asset_info, dict) and "candidates" not in matched_asset_info:
+                matched_asset_id = matched_asset_info.get("original_asset_id")
+
+            try:
+                db.add(
+                    EvidenceCheck(
+                        id=uuid.UUID(file_id),
+                        asset_id=uuid.UUID(matched_asset_id) if matched_asset_id else None,
+                        sha256_hash=sha256_hash,
+                        phash=computed_phash,
+                        verdict=verification_status,
+                        match_method=(matched_asset_info or {}).get("match_method"),
+                        orb_inliers=(matched_asset_info or {}).get("orb_inliers"),
+                        orb_inlier_ratio=(matched_asset_info or {}).get("orb_inlier_ratio"),
+                        phash_distance=(matched_asset_info or {}).get("phash_distance"),
+                        saved_filename=saved_filename,
+                    )
+                )
+                custody.append_entry(
+                    db,
+                    subject_type=custody.SUBJECT_EVIDENCE,
+                    subject_id=uuid.UUID(file_id),
+                    event_type=custody.CHECK_PERFORMED,
+                    payload={
+                        "sha256": sha256_hash,
+                        "verdict": verification_status,
+                        "match_method": (matched_asset_info or {}).get("match_method"),
+                        "orb_inliers": (matched_asset_info or {}).get("orb_inliers"),
+                        "matched_asset_id": matched_asset_id,
+                        "saved_filename": saved_filename,
+                    },
+                )
+                db.commit()
+                file_result["persisted"] = True
+            except Exception as persist_err:
+                db.rollback()
+                print(f"Could not persist check {file_id}: {persist_err}")
 
         results.append(file_result)
 
@@ -930,3 +998,123 @@ def get_difference_overlay(
             ),
         )
     return FileResponse(overlay_path, media_type="image/png")
+
+
+# ---------------------------------------------------------------------------
+# Chain of custody
+# ---------------------------------------------------------------------------
+
+VALID_SUBJECT_TYPES = {custody.SUBJECT_ASSET, custody.SUBJECT_EVIDENCE}
+
+
+def _validate_subject(subject_type: str, subject_id: str):
+    if subject_type not in VALID_SUBJECT_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"subject_type must be one of {sorted(VALID_SUBJECT_TYPES)}.",
+        )
+    try:
+        uuid.UUID(subject_id)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid subject id.")
+
+
+@app.get("/custody/{subject_type}/{subject_id}")
+def get_custody(subject_type: str, subject_id: str, db: Session = Depends(get_db)):
+    """The full handling history of one asset or one piece of evidence."""
+    _validate_subject(subject_type, subject_id)
+    entries = custody.list_entries(db, subject_type, subject_id)
+    return {
+        "subject_type": subject_type,
+        "subject_id": subject_id,
+        "count": len(entries),
+        "entries": entries,
+    }
+
+
+@app.get("/custody/{subject_type}/{subject_id}/verify")
+def verify_custody(subject_type: str, subject_id: str, db: Session = Depends(get_db)):
+    """Recompute the chain and report whether it is intact.
+
+    This is what to run if the record is suspected of having been edited. Every
+    entry hash is recomputed from that entry's contents plus its predecessor's
+    hash, so altering one entry breaks its own hash and every hash after it.
+    """
+    _validate_subject(subject_type, subject_id)
+    entries = custody.list_entries(db, subject_type, subject_id)
+    report = custody.verify_chain(entries)
+    report.update({"subject_type": subject_type, "subject_id": subject_id})
+    return report
+
+
+@app.get("/checks")
+def list_checks(limit: int = 50, offset: int = 0, db: Session = Depends(get_db)):
+    """Recent comparisons, newest first."""
+    rows = db.execute(
+        text("""
+            SELECT c.id, c.verdict, c.match_method, c.orb_inliers, c.saved_filename,
+                   c.created_at, a.file_name AS asset_name
+            FROM evidence_checks c
+            LEFT JOIN original_assets a ON a.id = c.asset_id
+            ORDER BY c.created_at DESC
+            LIMIT :limit OFFSET :offset
+        """),
+        {"limit": limit, "offset": offset},
+    ).fetchall()
+
+    total = db.execute(text("SELECT count(*) FROM evidence_checks;")).scalar()
+
+    return {
+        "total": total,
+        "checks": [
+            {
+                "file_id": str(row.id),
+                "verification_status": row.verdict,
+                "match_method": row.match_method,
+                "orb_inliers": row.orb_inliers,
+                "saved_filename": row.saved_filename,
+                "matched_asset_name": row.asset_name,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            }
+            for row in rows
+        ],
+    }
+
+
+@app.get("/checks/{check_id}")
+def get_check(check_id: str, db: Session = Depends(get_db)):
+    """A stored comparison, so a result survives a page reload."""
+    try:
+        uuid.UUID(check_id)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid check id.")
+
+    row = db.execute(
+        text("""
+            SELECT id, asset_id, sha256_hash, phash, verdict, match_method,
+                   orb_inliers, orb_inlier_ratio, phash_distance,
+                   saved_filename, created_at
+            FROM evidence_checks
+            WHERE id = :id
+        """),
+        {"id": check_id},
+    ).fetchone()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="Check not found.")
+
+    return {
+        "file_id": str(row.id),
+        "asset_id": str(row.asset_id) if row.asset_id else None,
+        "sha256_hash": row.sha256_hash,
+        "phash": row.phash,
+        "verification_status": row.verdict,
+        "match_method": row.match_method,
+        "orb_inliers": row.orb_inliers,
+        "orb_inlier_ratio": (
+            float(row.orb_inlier_ratio) if row.orb_inlier_ratio is not None else None
+        ),
+        "phash_distance": row.phash_distance,
+        "saved_filename": row.saved_filename,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }

@@ -29,6 +29,11 @@ from dotenv import dotenv_values
 
 BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# The script lives in scripts/, so the backend package folder is not on the
+# import path by default. models.py, database.py and schema.sql all live there.
+if BACKEND_DIR not in sys.path:
+    sys.path.insert(0, BACKEND_DIR)
+
 
 def get_database_url() -> str:
     env_path = os.path.join(BACKEND_DIR, ".env")
@@ -103,6 +108,24 @@ def main() -> int:
         "ON original_assets (sha256_hash);"
     )
     print("index uq_original_assets_sha256: ensured")
+
+    # --- tables ------------------------------------------------------------
+    # Defined once in models.py. create_all only adds what is missing, so it is
+    # safe to run against an existing database.
+    import models  # noqa: F401  (registers the tables on Base.metadata)
+    from database import Base, engine
+
+    Base.metadata.create_all(bind=engine)
+    print("tables ensured: " + ", ".join(sorted(Base.metadata.tables)))
+
+    # --- constraints SQLAlchemy cannot express ------------------------------
+    schema_path = os.path.join(BACKEND_DIR, "schema.sql")
+    if os.path.exists(schema_path):
+        with open(schema_path) as handle:
+            cur.execute(handle.read())
+        print("applied schema.sql (append-only guard on custody_entries)")
+    else:
+        print(f"WARNING: {schema_path} not found; append-only guard NOT applied")
 
     conn.commit()
 

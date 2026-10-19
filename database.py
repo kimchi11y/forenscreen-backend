@@ -1,11 +1,14 @@
 import logging
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-load_dotenv()
+# Resolved relative to this file rather than the working directory, so the app
+# and the migration script find the same .env no matter where they are run from.
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 logger = logging.getLogger("forenscreen.database")
 
