@@ -268,14 +268,15 @@ from PIL import Image
 import imagehash
 
 import matching
-from database import get_db, engine, Base
+from database import get_db, ensure_schema
 from models import OriginalAsset
 
 # Pillow does not decode HEIC/HEIF files unless this plugin is registered.
 register_heif_opener()
 
-# Dynamically ensure tables are built (if they don't already exist)
-Base.metadata.create_all(bind=engine)
+# Ensure tables exist. Tolerates an unreachable database so the process still
+# starts and can serve /health instead of hanging on connect.
+ensure_schema()
 
 @app.post("/upload-asset/", status_code=status.HTTP_201_CREATED)
 async def upload_original_asset(file: UploadFile = File(...), db: Session = Depends(get_db)):
@@ -756,6 +757,44 @@ async def upload_evidence(
         "success": True,
         "message": f"Successfully evaluated {len(results)} file(s) against secure ledger.",
         "files": results
+    }
+
+
+@app.get("/assets")
+def list_assets(limit: int = 100, offset: int = 0, db: Session = Depends(get_db)):
+    """Registered originals, newest first. Never returns `file_data`.
+
+    The registry view and the "check against" picker both need this. Without it
+    the frontend could only show what it had uploaded in the current browser
+    session, which is also why picking a specific original was impossible.
+    """
+    rows = db.execute(
+        text("""
+            SELECT id, file_name, phash, sha256_hash, created_at
+            FROM original_assets
+            ORDER BY created_at DESC
+            LIMIT :limit OFFSET :offset;
+        """),
+        {"limit": limit, "offset": offset},
+    ).fetchall()
+
+    total = db.execute(text("SELECT count(*) FROM original_assets;")).scalar()
+
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "assets": [
+            {
+                "id": str(row.id),
+                "file_name": row.file_name,
+                "phash": row.phash,
+                "sha256": row.sha256_hash,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "image_url": f"/view-asset/{row.id}",
+            }
+            for row in rows
+        ],
     }
 
 
