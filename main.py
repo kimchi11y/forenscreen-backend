@@ -260,11 +260,14 @@ def analyze_compression_artifacts(image: Image.Image) -> dict:
 import hashlib
 import io
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status
-from fastapi.responses import StreamingResponse
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse, StreamingResponse
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from PIL import Image
 import imagehash
 
+import matching
 from database import get_db, engine, Base
 from models import OriginalAsset
 
@@ -293,33 +296,80 @@ async def upload_original_asset(file: UploadFile = File(...), db: Session = Depe
             detail="Uploaded file is not a supported image (PNG, JPEG, or HEIC/HEIF).",
         ) from exc
 
-    try:
-        # 3. Compute Strict Cryptographic Signature (SHA-256)
-        sha256_sig = hashlib.sha256(file_bytes).hexdigest()
+    # 3. Compute the strict cryptographic signature (SHA-256)
+    sha256_sig = hashlib.sha256(file_bytes).hexdigest()
 
-        # 4. Bind information to our database record
-        new_asset = OriginalAsset(
-            file_name=file.filename,
-            file_data=file_bytes, # Storing binary payload directly
-            phash=calculated_phash,
-            sha256_hash=sha256_sig
+    # 4. Refuse to register bytes we already hold. Two byte-identical originals
+    #    share a pHash exactly, so a second copy sits at distance 0 from the
+    #    first; with an ambiguity margin of 4 bits that pushed every later
+    #    verification of that file into AMBIGUOUS_MATCH instead of
+    #    VERIFIED_AUTHENTIC. Returning the existing row keeps the registry 1:1
+    #    with distinct files and makes re-registration idempotent.
+    existing = (
+        db.query(OriginalAsset)
+        .filter(OriginalAsset.sha256_hash == sha256_sig)
+        .order_by(OriginalAsset.created_at.asc())
+        .first()
+    )
+    if existing is not None:
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "message": "Asset already registered - returning the existing record",
+                "duplicate": True,
+                "id": str(existing.id),
+                "file_name": existing.file_name,
+                "phash": existing.phash,
+                "sha256": existing.sha256_hash,
+            },
         )
 
+    # 5. Bind information to our database record
+    new_asset = OriginalAsset(
+        file_name=file.filename,
+        file_data=file_bytes, # Storing binary payload directly
+        phash=calculated_phash,
+        sha256_hash=sha256_sig
+    )
+
+    try:
         db.add(new_asset)
         db.commit()
         db.refresh(new_asset)
-
-        return {
-            "message": "Asset safely stored in Neon DB",
-            "id": str(new_asset.id),
-            "file_name": new_asset.file_name,
-            "phash": new_asset.phash,
-            "sha256": new_asset.sha256_hash
-        }
-
+    except IntegrityError:
+        # Lost a race against a concurrent registration of the same bytes. The
+        # UNIQUE index on sha256_hash is the source of truth, so return theirs.
+        db.rollback()
+        winner = (
+            db.query(OriginalAsset)
+            .filter(OriginalAsset.sha256_hash == sha256_sig)
+            .first()
+        )
+        if winner is None:
+            raise
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "message": "Asset already registered - returning the existing record",
+                "duplicate": True,
+                "id": str(winner.id),
+                "file_name": winner.file_name,
+                "phash": winner.phash,
+                "sha256": winner.sha256_hash,
+            },
+        )
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to process image asset: {str(e)}")
+
+    return {
+        "message": "Asset safely stored in Neon DB",
+        "duplicate": False,
+        "id": str(new_asset.id),
+        "file_name": new_asset.file_name,
+        "phash": new_asset.phash,
+        "sha256": new_asset.sha256_hash
+    }
 
 
 @app.get("/view-asset/{asset_id}")
@@ -435,15 +485,29 @@ def detect_manipulation_indicators(edit_data: dict, image_data: dict) -> list:
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-# How close two pHash values (in bits, out of 64) must be to be considered
-# the same underlying image.
+# pHash is a pre-filter, not a verdict. It is kept deliberately loose because
+# its only job is to pick which registered originals are worth a full ORB
+# comparison - a 25% crop alone moves pHash by ~24 bits, and rejecting a
+# candidate here means it is never offered to the matcher.
+PHASH_PREFILTER_THRESHOLD = 24
+PHASH_PREFILTER_LIMIT = 5
+
+# Still used as the fallback signal when ORB cannot judge a candidate at all
+# (texture-poor image), where a strict distance is the right thing to demand.
 PHASH_MATCH_THRESHOLD = 10
-# If the #2 candidate is within this many bits of the #1 candidate, the match
-# is ambiguous (could plausibly be either original) and must not be silently
-# resolved by picking the numerically-closest one. This is what caused two
-# registered originals (A and C) to be confused with each other when
-# verifying a tampered derivative of A.
-PHASH_AMBIGUITY_MARGIN = 4
+
+# Two candidates whose inlier counts are within this fraction of each other are
+# geometrically indistinguishable, so the verdict must not silently pick one.
+ORB_AMBIGUITY_INLIER_RATIO = 0.15
+
+# ORB reasons that mean "could not form an opinion", as opposed to "looked and
+# decided these are different pictures". Only the former may fall back to pHash.
+ORB_UNVERIFIABLE = {
+    "too_few_keypoints",
+    "too_few_good_matches",
+    "homography_failed",
+    "undecodable_original",
+}
 
 
 @app.post("/upload")
@@ -494,9 +558,35 @@ async def upload_evidence(
         with open(file_path, "wb") as f:
             f.write(file_content)
 
-        # Initialize core verification status variables
-        verification_status = "UNKNOWN_ASSET"
-        matched_asset_info = None
+        # 1. EXACT FILE MATCH FIRST. If these exact bytes are already registered
+        #    the answer is definitive and needs no perceptual reasoning: the file
+        #    is unmodified. Doing this before the pHash search is what stops a
+        #    byte-identical re-upload from coming back as AMBIGUOUS_MATCH whenever
+        #    the registry holds more than one visually similar original - which
+        #    includes the same image having been registered more than once.
+        exact_hit = db.execute(
+            text("""
+                SELECT id, file_name, phash, sha256_hash
+                FROM original_assets
+                WHERE sha256_hash = :sha256
+                ORDER BY created_at ASC
+                LIMIT 1;
+            """),
+            {"sha256": sha256_hash},
+        ).fetchone()
+
+        if exact_hit is not None:
+            verification_status = "VERIFIED_AUTHENTIC"
+            matched_asset_info = {
+                "original_asset_id": str(exact_hit.id),
+                "original_filename": exact_hit.file_name,
+                "original_sha256": exact_hit.sha256_hash,
+                "match_method": "sha256_exact",
+            }
+        else:
+            verification_status = "UNKNOWN_ASSET"
+            matched_asset_info = None
+
         forensic_data = {}
 
         # Perform visual similarity search if the uploaded file is an image
@@ -506,82 +596,134 @@ async def upload_evidence(
                 image = Image.open(io.BytesIO(file_content))
                 computed_phash = str(imagehash.phash(image))
 
-                match = None
-                ambiguous_candidates = None
-
-                if original_asset_id:
-                    # Explicit scoping requested: verify against this exact
-                    # registered original only, no similarity search needed.
-                    scoped_query = text("""
-                        SELECT id, file_name, phash, sha256_hash
-                        FROM original_assets
-                        WHERE id = :asset_id;
-                    """)
-                    match = db.execute(scoped_query, {"asset_id": original_asset_id}).fetchone()
-                else:
-                    # 3. NEON DB QUERY: Search original assets for close visual matches
-                    # using Postgres bitwise XOR (#). We fetch the top 2 candidates
-                    # (not just 1) so we can detect ambiguous matches instead of
-                    # blindly trusting whichever one happens to be numerically
-                    # closest - two unrelated registered originals (e.g. two
-                    # similar-looking screenshots) can easily land within a few
-                    # bits of each other in pHash space.
-                    search_query = text("""
-                        SELECT id, file_name, phash, sha256_hash,
-                               BIT_COUNT(('x' || phash)::bit(64) # ('x' || :query_phash)::bit(64)) AS distance
-                        FROM original_assets
-                        WHERE BIT_COUNT(('x' || phash)::bit(64) # ('x' || :query_phash)::bit(64)) <= :threshold
-                        ORDER BY distance ASC
-                        LIMIT 2;
-                    """)
-
-                    candidates = db.execute(
-                        search_query,
-                        {"query_phash": computed_phash, "threshold": PHASH_MATCH_THRESHOLD}
-                    ).fetchall()
-
-                    if len(candidates) >= 2:
-                        best, runner_up = candidates[0], candidates[1]
-                        if (runner_up.distance - best.distance) < PHASH_AMBIGUITY_MARGIN:
-                            ambiguous_candidates = [
-                                {
-                                    "original_asset_id": str(c.id),
-                                    "original_filename": c.file_name,
-                                    "original_sha256": c.sha256_hash,
-                                    "phash_distance": c.distance,
-                                }
-                                for c in candidates
-                            ]
-                        else:
-                            match = best
-                    elif len(candidates) == 1:
-                        match = candidates[0]
-
-                if ambiguous_candidates:
-                    verification_status = "AMBIGUOUS_MATCH"
-                    matched_asset_info = {
-                        "candidates": ambiguous_candidates,
-                        "message": (
-                            "Multiple registered originals are visually similar enough "
-                            "that this evidence cannot be reliably matched automatically. "
-                            "Re-verify against a specific original_asset_id."
-                        )
-                    }
-                elif match:
-                    # Map out matching asset metadata retrieved from Neon
-                    matched_asset_info = {
-                        "original_asset_id": str(match.id),
-                        "original_filename": match.file_name,
-                        "original_sha256": match.sha256_hash
-                    }
-
-                    # 4. CROSS-REFERENCE INTEGRITY: Check if the hashes match bit-by-bit
-                    if sha256_hash == match.sha256_hash:
-                        verification_status = "VERIFIED_AUTHENTIC"
+                # 2. pHash pre-filter. It only decides which registered originals
+                #    are worth the cost of a full comparison, so it is deliberately
+                #    generous - a 25% crop moves pHash by ~24 bits. ORB, not this
+                #    threshold, is what rejects a bad candidate.
+                if exact_hit is None:
+                    if original_asset_id:
+                        # Explicit scoping: the caller already knows which
+                        # original this evidence belongs to.
+                        candidates = db.execute(
+                            text("""
+                                SELECT id, file_name, phash, sha256_hash, 0 AS distance
+                                FROM original_assets
+                                WHERE id = :asset_id;
+                            """),
+                            {"asset_id": original_asset_id},
+                        ).fetchall()
                     else:
+                        candidates = db.execute(
+                            text("""
+                                SELECT id, file_name, phash, sha256_hash,
+                                       BIT_COUNT(('x' || phash)::bit(64) # ('x' || :query_phash)::bit(64)) AS distance
+                                FROM original_assets
+                                WHERE BIT_COUNT(('x' || phash)::bit(64) # ('x' || :query_phash)::bit(64)) <= :threshold
+                                ORDER BY distance ASC
+                                LIMIT :limit;
+                            """),
+                            {
+                                "query_phash": computed_phash,
+                                "threshold": PHASH_PREFILTER_THRESHOLD,
+                                "limit": PHASH_PREFILTER_LIMIT,
+                            },
+                        ).fetchall()
+
+                    # 3. Load the candidate bytes. Fetched here rather than in the
+                    #    search above so we do not pull megabytes of BYTEA for
+                    #    candidates that ORB is never going to look at.
+                    payload = []
+                    for candidate in candidates:
+                        blob = db.execute(
+                            text("SELECT file_data FROM original_assets WHERE id = :id"),
+                            {"id": candidate.id},
+                        ).fetchone()
+                        if blob is None or blob.file_data is None:
+                            continue
+                        payload.append({
+                            "id": candidate.id,
+                            "file_name": candidate.file_name,
+                            "sha256_hash": candidate.sha256_hash,
+                            "phash_distance": int(candidate.distance),
+                            "file_data": bytes(blob.file_data),
+                        })
+
+                    # 4. ORB + RANSAC decides. CPU-bound, so it goes to a worker
+                    #    thread instead of blocking the event loop.
+                    ranked = (
+                        await run_in_threadpool(
+                            matching.rank_candidates, file_content, payload
+                        )
+                        if payload
+                        else []
+                    )
+
+                    winners = [r for r in ranked if r["ok"]]
+
+                    if (
+                        len(winners) >= 2
+                        and (winners[0]["inliers"] - winners[1]["inliers"])
+                        <= ORB_AMBIGUITY_INLIER_RATIO * winners[0]["inliers"]
+                    ):
+                        verification_status = "AMBIGUOUS_MATCH"
+                        matched_asset_info = {
+                            "candidates": [
+                                {
+                                    "original_asset_id": str(w["original_asset_id"]),
+                                    "original_filename": w["original_filename"],
+                                    "original_sha256": w["original_sha256"],
+                                    "orb_inliers": w["inliers"],
+                                    "phash_distance": w["phash_distance"],
+                                }
+                                for w in winners
+                            ],
+                            "message": (
+                                "More than one registered original is geometrically "
+                                "consistent with this evidence. Re-verify against a "
+                                "specific original_asset_id to resolve."
+                            ),
+                        }
+                    elif winners:
+                        best = winners[0]
                         verification_status = "TAMPERED_MANIPULATED"
-                else:
-                    verification_status = "UNREGISTERED_ASSET"
+                        matched_asset_info = {
+                            "original_asset_id": str(best["original_asset_id"]),
+                            "original_filename": best["original_filename"],
+                            "original_sha256": best["original_sha256"],
+                            "match_method": "orb_ransac",
+                            "orb_inliers": best["inliers"],
+                            "orb_inlier_ratio": best["inlier_ratio"],
+                            "orb_good_matches": best["good_matches"],
+                            "phash_distance": best["phash_distance"],
+                        }
+                    elif ranked and all(
+                        r["reason"] in ORB_UNVERIFIABLE for r in ranked
+                    ):
+                        # ORB could not judge any candidate (texture-poor or very
+                        # flat image). Fall back to the pHash distance as a weaker
+                        # signal rather than silently calling the evidence
+                        # unregistered, and say so in match_method.
+                        fallback = min(
+                            (r for r in ranked if r["phash_distance"] is not None),
+                            key=lambda r: r["phash_distance"],
+                            default=None,
+                        )
+                        if (
+                            fallback is not None
+                            and fallback["phash_distance"] <= PHASH_MATCH_THRESHOLD
+                        ):
+                            verification_status = "TAMPERED_MANIPULATED"
+                            matched_asset_info = {
+                                "original_asset_id": str(fallback["original_asset_id"]),
+                                "original_filename": fallback["original_filename"],
+                                "original_sha256": fallback["original_sha256"],
+                                "match_method": "phash_fallback",
+                                "phash_distance": fallback["phash_distance"],
+                            }
+                        else:
+                            verification_status = "UNREGISTERED_ASSET"
+                    else:
+                        verification_status = "UNREGISTERED_ASSET"
 
                 # Run your existing screenshot forensics pipeline
                 # (Passing file_content or updating your method internally)
@@ -615,3 +757,137 @@ async def upload_evidence(
         "message": f"Successfully evaluated {len(results)} file(s) against secure ledger.",
         "files": results
     }
+
+
+# ---------------------------------------------------------------------------
+# Difference map - "where did it change?"
+# ---------------------------------------------------------------------------
+# The verdict tells you *that* the evidence differs from the original. These two
+# routes tell you *where*, by warping the original into the evidence's frame
+# with the homography ORB already recovered, differencing the two, and
+# thresholding the result. Results are cached beside the evidence file, keyed by
+# (evidence, original), so the second and later requests are free.
+
+def _evidence_path(file_id: str):
+    """Resolve an evidence id to its stored file.
+
+    The id arrives from the client, so it is validated as a UUID first - that
+    removes any possibility of a crafted value escaping the uploads directory.
+    """
+    try:
+        uuid.UUID(file_id)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid evidence id.")
+
+    for candidate in UPLOAD_DIR.glob(f"{file_id}.*"):
+        if "__" not in candidate.name:  # skip our own cache sidecars
+            return candidate
+    return None
+
+
+def _build_difference_artifacts(file_id: str, original_asset_id: str, db: Session):
+    """Return (payload, overlay_path|None) for one evidence/original pair."""
+    try:
+        uuid.UUID(original_asset_id)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid original_asset_id.")
+
+    regions_path = UPLOAD_DIR / f"{file_id}__{original_asset_id}__regions.json"
+    overlay_path = UPLOAD_DIR / f"{file_id}__{original_asset_id}__overlay.png"
+
+    if regions_path.exists():
+        overlay = overlay_path if overlay_path.exists() else None
+        return json.loads(regions_path.read_text()), overlay
+
+    evidence_file = _evidence_path(file_id)
+    if evidence_file is None:
+        raise HTTPException(status_code=404, detail="Evidence file not found.")
+
+    original = db.execute(
+        text("SELECT file_data FROM original_assets WHERE id = :id"),
+        {"id": original_asset_id},
+    ).fetchone()
+    if original is None or original.file_data is None:
+        raise HTTPException(status_code=404, detail="Original asset not found.")
+
+    evidence_bgr = matching.decode_bgr(evidence_file.read_bytes())
+    original_bgr = matching.decode_bgr(bytes(original.file_data))
+    if evidence_bgr is None or original_bgr is None:
+        raise HTTPException(status_code=422, detail="Could not decode image.")
+
+    height, width = evidence_bgr.shape[:2]
+    result = matching.match_images(original_bgr, evidence_bgr)
+
+    if not result["ok"] or result["homography"] is None:
+        payload = {
+            "file_id": file_id,
+            "original_asset_id": original_asset_id,
+            "matched": False,
+            "reason": result["reason"],
+            "width": width,
+            "height": height,
+            "regions": [],
+        }
+        regions_path.write_text(json.dumps(payload, indent=2))
+        return payload, None
+
+    _, mask, boxes = matching.difference_map(
+        original_bgr, evidence_bgr, result["homography"]
+    )
+    payload = {
+        "file_id": file_id,
+        "original_asset_id": original_asset_id,
+        "matched": True,
+        "width": width,
+        "height": height,
+        "orb_inliers": result["inliers"],
+        "orb_inlier_ratio": result["inlier_ratio"],
+        "regions": [
+            {
+                "x": x, "y": y, "w": w, "h": h,
+                "x_pct": round(x / width * 100, 2),
+                "y_pct": round(y / height * 100, 2),
+                "w_pct": round(w / width * 100, 2),
+                "h_pct": round(h / height * 100, 2),
+            }
+            for x, y, w, h in boxes
+        ],
+    }
+    regions_path.write_text(json.dumps(payload, indent=2))
+
+    overlay_png = matching.render_overlay_png(evidence_bgr, mask)
+    if overlay_png is not None:
+        overlay_path.write_bytes(overlay_png)
+
+    return payload, (overlay_path if overlay_path.exists() else None)
+
+
+@app.get("/evidence/{file_id}/altered-regions")
+def get_altered_regions(
+    file_id: str, original_asset_id: str, db: Session = Depends(get_db)
+):
+    """Rectangles where the evidence differs from the original it matched.
+
+    Reported in pixels and as percentages of the analysed frame. Matching runs
+    on a downscaled copy (long edge capped by matching.MATCH_MAX_EDGE), so the
+    percentages are the resolution-independent values to lay out UI with.
+    """
+    payload, _ = _build_difference_artifacts(file_id, original_asset_id, db)
+    return payload
+
+
+@app.get("/evidence/{file_id}/difference-overlay")
+def get_difference_overlay(
+    file_id: str, original_asset_id: str, db: Session = Depends(get_db)
+):
+    """The evidence image with the differing pixels tinted red, as a PNG."""
+    _, overlay_path = _build_difference_artifacts(file_id, original_asset_id, db)
+    if overlay_path is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "No difference overlay: the evidence did not geometrically "
+                "match the original."
+            ),
+        )
+    return FileResponse(overlay_path, media_type="image/png")
