@@ -1207,6 +1207,91 @@ def list_checks(limit: int = 50, offset: int = 0, db: Session = Depends(get_db))
     }
 
 
+@app.get("/verify-anchor/{sha256}")
+def verify_anchor(sha256: str, db: Session = Depends(get_db)):
+    """Independently check a digest: what the database claims, what the chain says.
+
+    This is the endpoint a third party can use without trusting the rest of this
+    application. It compares three things - the registry, the on-chain anchor,
+    and the integrity of the local custody chain - and reports where they agree
+    and where they do not.
+
+    Disagreement is the interesting case. `anchored_not_registered` means a
+    digest is on-chain that this database has no record of, which is exactly the
+    signal you would want if someone were trying to hide a registration.
+    """
+    digest = (sha256 or "").strip().lower()
+    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        raise HTTPException(
+            status_code=400,
+            detail="Expected a 64-character hexadecimal SHA-256 digest.",
+        )
+
+    row = db.execute(
+        text("""
+            SELECT id, file_name, phash, created_at
+            FROM original_assets
+            WHERE sha256_hash = :digest
+            ORDER BY created_at ASC
+            LIMIT 1
+        """),
+        {"digest": digest},
+    ).fetchone()
+
+    registered = row is not None
+    chain = blockchain.get_anchor(digest)
+
+    custody_report = None
+    if registered:
+        entries = custody.list_entries(db, custody.SUBJECT_ASSET, row.id)
+        custody_report = custody.verify_chain(entries)
+
+    anchored = bool(chain.get("anchored"))
+    if registered and anchored:
+        state = "registered_and_anchored"
+    elif registered:
+        state = "registered_not_anchored"
+    elif anchored:
+        state = "anchored_not_registered"
+    else:
+        state = "not_found"
+
+    explanations = {
+        "registered_and_anchored": (
+            "This file is in the registry and its fingerprint is anchored on-chain. "
+            "The record can be checked by anyone without trusting ForenScreen."
+        ),
+        "registered_not_anchored": (
+            "This file is in the registry, but its fingerprint is not on-chain. "
+            "The record is only as trustworthy as this database."
+        ),
+        "anchored_not_registered": (
+            "This fingerprint is anchored on-chain but missing from the registry. "
+            "That mismatch is worth investigating."
+        ),
+        "not_found": "This fingerprint is neither registered nor anchored.",
+    }
+
+    return {
+        "sha256": digest,
+        "state": state,
+        "explanation": explanations[state],
+        "database": (
+            {
+                "registered": True,
+                "asset_id": str(row.id),
+                "file_name": row.file_name,
+                "phash": row.phash,
+                "registered_at": row.created_at.isoformat() if row.created_at else None,
+            }
+            if registered
+            else {"registered": False}
+        ),
+        "chain": chain,
+        "custody_chain": custody_report,
+    }
+
+
 @app.get("/checks/{check_id}")
 def get_check(check_id: str, db: Session = Depends(get_db)):
     """A stored comparison, so a result survives a page reload."""
