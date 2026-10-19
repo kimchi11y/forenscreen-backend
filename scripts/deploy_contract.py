@@ -21,6 +21,11 @@ BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ARTIFACT_PATH = os.path.join(BACKEND_DIR, "contracts", "EvidenceRegistry.json")
 GAS_LIMIT = 1_500_000
 
+if BACKEND_DIR not in sys.path:
+    sys.path.insert(0, BACKEND_DIR)
+
+from blockchain import fee_fields  # noqa: E402
+
 
 def main():
     rpc_url = os.getenv("SEPOLIA_RPC_URL")
@@ -61,8 +66,7 @@ def main():
             "nonce": w3.eth.get_transaction_count(account.address, "pending"),
             "chainId": w3.eth.chain_id,
             "gas": GAS_LIMIT,
-            "maxFeePerGas": w3.eth.gas_price * 2,
-            "maxPriorityFeePerGas": w3.to_wei(1, "gwei"),
+            **fee_fields(w3),
         }
     )
 

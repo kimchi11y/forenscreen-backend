@@ -29,6 +29,7 @@ import logging
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
 from web3 import Web3
 
 logger = logging.getLogger("forenscreen.blockchain")
@@ -36,11 +37,31 @@ logger = logging.getLogger("forenscreen.blockchain")
 BACKEND_DIR = Path(__file__).resolve().parent
 ARTIFACT_PATH = BACKEND_DIR / "contracts" / "EvidenceRegistry.json"
 
+# Loaded here rather than relying on the caller: this module is used by the API,
+# by the deploy script and by the verification scripts, and only one of those
+# goes through the app's database bootstrap.
+load_dotenv(BACKEND_DIR / ".env")
+
 DEFAULT_EXPLORER = "https://sepolia.etherscan.io"
 DEFAULT_CHAIN_ID = 11155111  # Sepolia
 
 # A mapping write plus an event; measured at ~46k on the deployed contract.
 GAS_LIMIT = 200_000
+
+# Public testnet RPCs sometimes report a gas price of a few wei. Doubling that
+# produces a maxFeePerGas the node rejects as underpriced, so fees get a floor.
+# This costs nothing extra in practice: you pay baseFee + priorityFee, never
+# maxFeePerGas.
+MIN_MAX_FEE_WEI = 3_000_000_000   # 3 gwei
+MIN_PRIORITY_FEE_WEI = 1_000_000_000  # 1 gwei
+
+
+def fee_fields(web3_instance) -> dict:
+    """EIP-1559 fee caps with a sane floor."""
+    base = web3_instance.eth.gas_price
+    max_fee = max(base * 2, MIN_MAX_FEE_WEI)
+    priority = min(max(base, MIN_PRIORITY_FEE_WEI), max_fee)
+    return {"maxFeePerGas": max_fee, "maxPriorityFeePerGas": priority}
 
 _web3 = None
 _contract = None
@@ -177,8 +198,7 @@ def anchor(sha256_hex: str) -> dict:
                 "nonce": _web3.eth.get_transaction_count(account.address, "pending"),
                 "chainId": _chain_id,
                 "gas": GAS_LIMIT,
-                "maxFeePerGas": _web3.eth.gas_price * 2,
-                "maxPriorityFeePerGas": _web3.to_wei(1, "gwei"),
+                **fee_fields(_web3),
             }
         )
         signed = account.sign_transaction(tx)
