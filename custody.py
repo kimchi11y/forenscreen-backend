@@ -47,6 +47,7 @@ ANCHOR_FAILED = "ANCHOR_FAILED"
 CHECK_PERFORMED = "CHECK_PERFORMED"
 AMBIGUITY_RESOLVED = "AMBIGUITY_RESOLVED"
 CASE_ATTACHED = "CASE_ATTACHED"
+CASE_DETACHED = "CASE_DETACHED"
 REPORT_EXPORTED = "REPORT_EXPORTED"
 NOTE_ADDED = "NOTE_ADDED"
 # Written to an original's log when another account registers a similar picture.
@@ -75,6 +76,7 @@ EVENT_LABELS = {
     CHECK_PERFORMED: "Comparison performed",
     AMBIGUITY_RESOLVED: "Matched original chosen by user",
     CASE_ATTACHED: "Attached to a case",
+    CASE_DETACHED: "Removed from a case",
     REPORT_EXPORTED: "Report exported",
     NOTE_ADDED: "Note added",
     SIMILAR_REGISTERED: "Similar image registered by another account",
