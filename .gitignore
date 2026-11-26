@@ -12,3 +12,6 @@ dist/
 build/
 .env
 .ansible
+
+# Junk moved aside by scripts/find_junk_uploads.py --apply
+uploads_quarantine/

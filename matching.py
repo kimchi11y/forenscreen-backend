@@ -248,6 +248,115 @@ def difference_map(original_bgr, evidence_bgr, homography):
     return aligned, mask, boxes
 
 
+# --- re-saved vs edited -----------------------------------------------------
+# A platform re-save (Instagram, X, WhatsApp) changes every byte but no content.
+# Such a copy is only called "not edited" when nothing in the picture differs
+# AND it still shows nearly all of the original - a crop changes no pixels, but
+# it can cut a conversation short, so it must not pass as untouched.
+#
+# The difference map above is too coarse for this decision. Its heavy blur
+# keeps platform noise out of the heatmap, but it also blurs away a single
+# added digit - measured on real screenshots it missed most small edits. So
+# this uses its own, finer comparison: the alignment is refined to sub-pixel
+# accuracy (ECC), both images are softened equally so resampling differences
+# cancel out, and the largest remaining patch of change is measured.
+#
+# Calibrated on 5 real screenshots (26 Nov 2026): platform re-saves left at
+# most 35 px of change, the smallest edit tested (one added digit) at least
+# 32 px. The cut-off sits below both, so any doubt is reported as "Modified" -
+# a few heavily compressed copies are flagged, but no tested edit passed.
+RESAVED_MIN_COVERAGE = 0.95
+RESAVED_MAX_CHANGE_PX = 25
+FINE_DIFF_SIGMA = 2.0
+FINE_DIFF_THRESHOLD = 30
+
+
+def _refine_homography(original_bgr, evidence_bgr, homography):
+    """Sub-pixel alignment via ECC, starting from ORB's estimate.
+
+    ORB + RANSAC is accurate to a pixel or two, and that slack along text edges
+    looks exactly like changed text. If ECC does not converge, ORB's estimate
+    is kept - a rougher alignment only makes a copy look more changed.
+    """
+    original_grey = cv2.cvtColor(original_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255
+    evidence_grey = cv2.cvtColor(evidence_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255
+    height, width = evidence_grey.shape
+    warped = cv2.warpPerspective(original_grey, homography, (width, height))
+    correction = np.eye(3, dtype=np.float32)
+    try:
+        _, correction = cv2.findTransformECC(
+            evidence_grey, warped, correction, cv2.MOTION_HOMOGRAPHY,
+            (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 1e-5), None, 5,
+        )
+    except cv2.error:
+        return homography
+    return np.linalg.inv(correction) @ homography
+
+
+def _largest_change_px(original_bgr, evidence_bgr, homography):
+    """Area of the largest patch where the aligned images still differ."""
+    height, width = evidence_bgr.shape[:2]
+    shrinking = abs(np.linalg.det(homography[:2, :2])) < 1
+    aligned = cv2.warpPerspective(
+        original_bgr, homography, (width, height),
+        flags=cv2.INTER_AREA if shrinking else cv2.INTER_LINEAR,
+    )
+    # Ignore the resampled edge of the original and anything outside it.
+    in_view = cv2.warpPerspective(
+        np.full(original_bgr.shape[:2], 255, np.uint8), homography, (width, height)
+    )
+    in_view = cv2.erode(in_view, np.ones((9, 9), np.uint8))
+
+    soft_a = cv2.GaussianBlur(cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY), (0, 0), FINE_DIFF_SIGMA)
+    soft_b = cv2.GaussianBlur(cv2.cvtColor(evidence_bgr, cv2.COLOR_BGR2GRAY), (0, 0), FINE_DIFF_SIGMA)
+    _, mask = cv2.threshold(cv2.absdiff(soft_a, soft_b), FINE_DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
+    mask[in_view == 0] = 0
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+
+    count, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+    return int(max((stats[i, cv2.CC_STAT_AREA] for i in range(1, count)), default=0))
+
+
+def assess_changes(original_bgr, evidence_bgr):
+    """Match two images and measure whether the picture itself was changed.
+
+    Returns ``{"matched": False, "reason": ...}`` when ORB cannot align them,
+    otherwise ``largest_change_px`` (biggest patch of change after fine
+    alignment) and ``coverage`` (share of the original still in view).
+    """
+    if original_bgr is None or evidence_bgr is None:
+        return {"matched": False, "reason": "undecodable"}
+    result = match_images(original_bgr, evidence_bgr)
+    homography = result["homography"]
+    if not result["ok"] or homography is None:
+        return {"matched": False, "reason": result["reason"]}
+
+    height, width = original_bgr.shape[:2]
+    ev_height, ev_width = evidence_bgr.shape[:2]
+    corners = np.float32([[0, 0], [width, 0], [width, height], [0, height]]).reshape(-1, 1, 2)
+    projected_area = abs(cv2.contourArea(cv2.perspectiveTransform(corners, homography)))
+    in_view = cv2.warpPerspective(
+        np.full((height, width), 255, np.uint8), homography, (ev_width, ev_height)
+    )
+    coverage = cv2.countNonZero(in_view) / projected_area if projected_area else 0.0
+
+    refined = _refine_homography(original_bgr, evidence_bgr, homography)
+    return {
+        "matched": True,
+        "largest_change_px": _largest_change_px(original_bgr, evidence_bgr, refined),
+        "coverage": round(min(coverage, 1.0), 3),
+    }
+
+
+def is_resaved_copy(assessment):
+    """True when a matched copy shows the whole picture and nothing in it differs."""
+    return bool(
+        assessment.get("matched")
+        and assessment["largest_change_px"] < RESAVED_MAX_CHANGE_PX
+        and assessment["coverage"] >= RESAVED_MIN_COVERAGE
+    )
+
+
 def render_overlay_png(evidence_bgr, mask, alpha=OVERLAY_ALPHA):
     """Tint the differing pixels red over the evidence and encode as PNG."""
     tinted = evidence_bgr.copy()

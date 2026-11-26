@@ -27,6 +27,14 @@ class OriginalAsset(Base):
     phash = Column(String(16), nullable=False)
     sha256_hash = Column(String(64), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+    # The account that registered it, as auth.actor_from() spells it
+    # ("user:<id>"). Only the owner may see the image or its filename; everyone
+    # else's checks can still be matched against it.
+    owner = Column(String(128), nullable=False, index=True)
+    # Set when this was registered despite a warning that another account had
+    # already registered a similar picture: the earlier original. A check that
+    # lands exactly on this asset is then not reported as a clean original.
+    similar_to = Column(UUID(as_uuid=True), ForeignKey("original_assets.id"), nullable=True)
 
 
 class EvidenceCheck(Base):
@@ -51,6 +59,9 @@ class EvidenceCheck(Base):
     phash_distance = Column(Integer, nullable=True)
     saved_filename = Column(String(255), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    # Who ran the check. NULL for an anonymous check from the public page,
+    # which is then reachable only through its own unguessable id.
+    owner = Column(String(128), nullable=True, index=True)
 
 
 class CustodyEntry(Base):

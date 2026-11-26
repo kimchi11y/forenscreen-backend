@@ -24,7 +24,7 @@ import os
 from urllib.parse import urlsplit
 
 import jwt
-from fastapi import HTTPException, Request, status
+from fastapi import Depends, HTTPException, Request, status
 from jwt import PyJWKClient
 
 logger = logging.getLogger("forenscreen.auth")
@@ -158,8 +158,8 @@ def optional_user(request: Request) -> dict | None:
         ) from exc
 
 
-def require_user(user: dict | None = None) -> dict:
-    """Unused placeholder for endpoints that must have an identity."""
+def require_user(user: dict | None = Depends(optional_user)) -> dict:
+    """Dependency: the verified claims, or 401 when there is no signed-in user."""
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

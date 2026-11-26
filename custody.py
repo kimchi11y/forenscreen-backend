@@ -49,6 +49,11 @@ AMBIGUITY_RESOLVED = "AMBIGUITY_RESOLVED"
 CASE_ATTACHED = "CASE_ATTACHED"
 REPORT_EXPORTED = "REPORT_EXPORTED"
 NOTE_ADDED = "NOTE_ADDED"
+# Written to an original's log when another account registers a similar picture.
+SIMILAR_REGISTERED = "SIMILAR_REGISTERED"
+# Written when a preview of an original is shown to another account, as part of
+# the warning that the picture they are registering is already registered.
+SHOWN_IN_SIMILARITY_WARNING = "SHOWN_IN_SIMILARITY_WARNING"
 
 ANCHOR_EVENTS = frozenset({ANCHOR_REQUESTED, ANCHOR_CONFIRMED, ANCHOR_FAILED})
 
@@ -72,6 +77,8 @@ EVENT_LABELS = {
     CASE_ATTACHED: "Attached to a case",
     REPORT_EXPORTED: "Report exported",
     NOTE_ADDED: "Note added",
+    SIMILAR_REGISTERED: "Similar image registered by another account",
+    SHOWN_IN_SIMILARITY_WARNING: "Preview shown to another account registering a similar image",
 }
 
 
