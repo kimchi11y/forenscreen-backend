@@ -2,7 +2,7 @@ from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 import hashlib
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 from PIL import Image
 from PIL import UnidentifiedImageError
@@ -81,6 +81,17 @@ def analyze_screenshot_forensics(image_content: bytes) -> dict:
             "megapixels": round((image.width * image.height) / 1000000, 2)
         }
 
+        # What the file says about itself: editing software, capture and
+        # modification times. Hints for a reviewer, never part of the verdict.
+        # GPS is reported only as present or not - this response may go to
+        # anyone, and the uploader did not choose to share a location.
+        file_meta = metadata.read_file_metadata(image_content)
+        file_meta.pop("_gps", None)
+        forensic_data["file_metadata"] = file_meta
+        forensic_data["metadata_signals"] = metadata.signals(
+            file_meta, datetime.now(timezone.utc)
+        )
+
         # File timeline data
         forensic_data["timeline_data"] = {
             "analysis_timestamp": datetime.now().isoformat(),
@@ -109,6 +120,7 @@ import auth
 import blockchain
 import custody
 import matching
+import metadata
 from database import SessionLocal, ensure_schema, get_db
 from models import CustodyEntry, EvidenceCheck, OriginalAsset
 
@@ -298,10 +310,15 @@ async def upload_original_asset(
     # Sent as true once the user has seen the "a similar image is already
     # registered" warning and chosen to register anyway.
     confirm_similar: bool = Form(False),
+    # JSON from the register page: {"device": {...}, "location": {...}}. The
+    # location is present only when the user switched "Share my location" on.
+    client_metadata: str = Form(None),
     user: dict = Depends(auth.require_user),
     db: Session = Depends(get_db),
 ):
-    # 1. Read the raw incoming file data into memory
+    # 1. Read the raw incoming file data into memory. The receipt time is
+    #    taken first, from this server's clock, which the client cannot set.
+    received_at = datetime.now(timezone.utc)
     file_bytes = await file.read()
     
     if not file_bytes:
@@ -383,7 +400,14 @@ async def upload_original_asset(
             },
         )
 
-    # 6. Bind information to our database record
+    # 6. Context for the record, every value labelled by where it came from.
+    try:
+        client = json.loads(client_metadata) if client_metadata else None
+    except json.JSONDecodeError:
+        client = None
+    registration_metadata = metadata.build(file_bytes, client, received_at)
+
+    # 7. Bind information to our database record
     new_asset = OriginalAsset(
         file_name=file.filename,
         file_data=file_bytes, # Storing binary payload directly
@@ -391,6 +415,7 @@ async def upload_original_asset(
         sha256_hash=sha256_sig,
         owner=_owner(user),
         similar_to=earlier["original_asset_id"] if earlier else None,
+        registration_metadata=registration_metadata,
     )
 
     try:
@@ -413,6 +438,9 @@ async def upload_original_asset(
                 "actor_email": (user or {}).get("email"),
                 "similar_to": str(earlier["original_asset_id"]) if earlier else None,
                 "similarity_warning_accepted": earlier is not None,
+                # No coordinates: this log can never be cleared. The hash
+                # commits it to the full record stored on the asset.
+                "metadata": metadata.for_custody(registration_metadata),
             },
         )
 
@@ -462,7 +490,8 @@ async def upload_original_asset(
         "id": str(new_asset.id),
         "file_name": new_asset.file_name,
         "phash": new_asset.phash,
-        "sha256": new_asset.sha256_hash
+        "sha256": new_asset.sha256_hash,
+        "registration_metadata": new_asset.registration_metadata,
     }
 
 
@@ -1014,7 +1043,7 @@ def list_assets(
     owner = _owner(user)
     rows = db.execute(
         text("""
-            SELECT id, file_name, phash, sha256_hash, created_at
+            SELECT id, file_name, phash, sha256_hash, created_at, registration_metadata
             FROM original_assets
             WHERE owner = :owner
             ORDER BY created_at DESC
@@ -1040,6 +1069,7 @@ def list_assets(
                 "sha256": row.sha256_hash,
                 "created_at": row.created_at.isoformat() if row.created_at else None,
                 "image_url": f"/view-asset/{row.id}",
+                "registration_metadata": row.registration_metadata,
             }
             for row in rows
         ],

@@ -35,6 +35,9 @@ class OriginalAsset(Base):
     # already registered a similar picture: the earlier original. A check that
     # lands exactly on this asset is then not reported as a clean original.
     similar_to = Column(UUID(as_uuid=True), ForeignKey("original_assets.id"), nullable=True)
+    # Context recorded at registration, every section labelled by its source
+    # (server clock, file EXIF/XMP, browser, opt-in location). See metadata.py.
+    registration_metadata = Column(JSONB, nullable=True)
 
 
 class EvidenceCheck(Base):
