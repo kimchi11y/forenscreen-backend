@@ -125,6 +125,24 @@ def actor_from(claims: dict | None) -> str:
     return f"user:{identifier}" if identifier else "unauthenticated"
 
 
+# Browser-extension tokens (see models.ExtensionToken) are recognised by this
+# prefix and checked against the database by a resolver main.py registers -
+# this module has no database access of its own.
+EXTENSION_TOKEN_PREFIX = "fsx_"
+
+# The only routes an extension token may call: register an original, and ask
+# who it is. Enforced here, once, so no route can forget to refuse one.
+EXTENSION_ALLOWED_PATHS = frozenset({"/upload-asset/", "/me"})
+
+_extension_resolver = None
+
+
+def set_extension_resolver(resolver) -> None:
+    """Register ``resolver(token) -> claims | None`` for extension tokens."""
+    global _extension_resolver
+    _extension_resolver = resolver
+
+
 def optional_user(request: Request) -> dict | None:
     """Dependency: the verified claims, or None for an anonymous request.
 
@@ -140,6 +158,21 @@ def optional_user(request: Request) -> dict | None:
     token = header.split(" ", 1)[1].strip()
     if not token:
         return None
+
+    if token.startswith(EXTENSION_TOKEN_PREFIX):
+        if request.url.path not in EXTENSION_ALLOWED_PATHS:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="The browser extension can only register originals.",
+            )
+        claims = _extension_resolver(token) if _extension_resolver else None
+        if claims is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="This extension is no longer connected. Connect it again from the web app.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return claims
 
     try:
         return verify_token(token)
