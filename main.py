@@ -202,7 +202,7 @@ def _describe_matches(db: Session, matched: dict | None, user: dict | None):
 
     rows = db.execute(
         text("""
-            SELECT id, owner, created_at FROM original_assets
+            SELECT id, owner, created_at, public_original FROM original_assets
             WHERE id = ANY(CAST(:ids AS uuid[]))
         """),
         {"ids": ids},
@@ -214,6 +214,9 @@ def _describe_matches(db: Session, matched: dict | None, user: dict | None):
         row = by_id.get(str(entry.get("original_asset_id")))
         is_owner = row is not None and me is not None and row.owner == me
         entry["is_owner"] = is_owner
+        # The owner may choose to show the original to everyone (E2). The
+        # filename stays private either way.
+        entry["original_public"] = bool(row is not None and row.public_original)
         entry["registered_at"] = (
             row.created_at.isoformat() if row is not None and row.created_at else None
         )
@@ -542,12 +545,15 @@ def _existing_registration(existing: OriginalAsset, user: dict) -> JSONResponse:
 @app.get("/view-asset/{asset_id}")
 def get_asset_image(
     asset_id: str,
-    user: dict = Depends(auth.require_user),
+    user: dict | None = Depends(auth.optional_user),
     db: Session = Depends(get_db),
 ):
-    """A registered original's image, for its owner only."""
-    _require_asset_owner(db, asset_id, user)
+    """A registered original's image: for its owner, or for anyone if the
+    owner chose to show it in public checks."""
+    _parse_uuid(asset_id, "asset id")
     asset = db.query(OriginalAsset).filter(OriginalAsset.id == asset_id).first()
+    if asset is None or (asset.owner != _owner(user) and not asset.public_original):
+        raise HTTPException(status_code=404, detail="Asset not found.")
 
     # Stream binary data directly back out as a standard displayable JPEG/PNG
     return StreamingResponse(io.BytesIO(asset.file_data), media_type="image/jpeg")
@@ -822,6 +828,24 @@ async def upload_evidence(
                             key=lambda r: (-r["inliers"], -r["inlier_ratio"]),
                         )
                         winners = [r for r in ranked if r["ok"]]
+
+                # 4c. A registration flagged as made after a similar earlier
+                #     original is nobody's baseline while an unflagged original
+                #     also matches: a re-shared copy of a fake should be judged
+                #     against the real original, not against the fake (E4).
+                if len(winners) >= 2:
+                    flagged = {
+                        str(r.id) for r in db.execute(
+                            text("""
+                                SELECT id FROM original_assets
+                                WHERE id = ANY(CAST(:ids AS uuid[])) AND similar_to IS NOT NULL
+                            """),
+                            {"ids": [str(w["original_asset_id"]) for w in winners]},
+                        ).fetchall()
+                    }
+                    unflagged = [w for w in winners if str(w["original_asset_id"]) not in flagged]
+                    if unflagged:
+                        winners = unflagged
 
                 if (
                     len(winners) >= 2
@@ -1128,7 +1152,8 @@ def list_assets(
     owner = _owner(user)
     rows = db.execute(
         text("""
-            SELECT id, file_name, phash, sha256_hash, created_at, registration_metadata
+            SELECT id, file_name, phash, sha256_hash, created_at, registration_metadata,
+                   public_original
             FROM original_assets
             WHERE owner = :owner
             ORDER BY created_at DESC
@@ -1155,6 +1180,7 @@ def list_assets(
                 "created_at": row.created_at.isoformat() if row.created_at else None,
                 "image_url": f"/view-asset/{row.id}",
                 "registration_metadata": row.registration_metadata,
+                "public_original": row.public_original,
             }
             for row in rows
         ],
@@ -1798,7 +1824,8 @@ def get_check(
             SELECT c.id, c.asset_id, c.sha256_hash, c.phash, c.verdict, c.match_method,
                    c.orb_inliers, c.orb_inlier_ratio, c.phash_distance,
                    c.saved_filename, c.created_at,
-                   a.owner AS asset_owner, a.created_at AS asset_registered_at
+                   a.owner AS asset_owner, a.created_at AS asset_registered_at,
+                   a.public_original AS asset_public
             FROM evidence_checks c
             LEFT JOIN original_assets a ON a.id = c.asset_id
             WHERE c.id = :id
@@ -1813,6 +1840,7 @@ def get_check(
         "file_id": str(row.id),
         "asset_id": str(row.asset_id) if row.asset_id else None,
         "asset_is_owner": row.asset_id is not None and row.asset_owner == _owner(user),
+        "asset_public": bool(row.asset_public),
         "asset_registered_at": (
             row.asset_registered_at.isoformat() if row.asset_registered_at else None
         ),
@@ -2395,3 +2423,102 @@ def revoke_extension_token(
         row.revoked_at = datetime.utcnow()
         db.commit()
     return _extension_token_summary(row)
+
+
+# ---------------------------------------------------------------------------
+# Owner controls: public originals, activity
+# ---------------------------------------------------------------------------
+
+class AssetSettings(BaseModel):
+    public_original: bool
+
+
+@app.patch("/assets/{asset_id}")
+def update_asset(
+    asset_id: str,
+    settings: AssetSettings,
+    user: dict = Depends(auth.require_user),
+    db: Session = Depends(get_db),
+):
+    """Let an owner show their original in other people's checks, or stop.
+
+    Useful when a fake of your screenshot is spreading: anyone who checks the
+    fake then sees your real one beside it. The change is a custody event.
+    """
+    _require_asset_owner(db, asset_id, user)
+    asset = db.get(OriginalAsset, uuid.UUID(asset_id))
+    if asset.public_original != settings.public_original:
+        asset.public_original = settings.public_original
+        custody.append_entry(
+            db,
+            subject_type=custody.SUBJECT_ASSET,
+            subject_id=asset.id,
+            event_type=custody.ORIGINAL_VISIBILITY_CHANGED,
+            actor=auth.actor_from(user),
+            payload={"public": settings.public_original},
+        )
+        db.commit()
+    return {"id": asset_id, "public_original": asset.public_original}
+
+
+ACTIVITY_EVENTS = {
+    custody.SIMILAR_REGISTERED: "Another account registered a similar image",
+    custody.SHOWN_IN_SIMILARITY_WARNING: "A preview was shown to someone registering a similar image",
+}
+
+
+@app.get("/activity")
+def owner_activity(user: dict = Depends(auth.require_user), db: Session = Depends(get_db)):
+    """What other people did with the caller's originals, newest first (E3).
+
+    Checks by other people that matched one of your originals, and the
+    similarity events written to your originals' custody logs. Never says who:
+    other people's identities stay private, as yours do to them.
+    """
+    owner = _owner(user)
+    checks = db.execute(
+        text("""
+            SELECT a.id AS asset_id, a.file_name, c.verdict, c.created_at
+            FROM evidence_checks c
+            JOIN original_assets a ON a.id = c.asset_id
+            WHERE a.owner = :owner AND c.owner IS DISTINCT FROM :owner
+            ORDER BY c.created_at DESC
+            LIMIT 20
+        """),
+        {"owner": owner},
+    ).fetchall()
+    events = db.execute(
+        text("""
+            SELECT a.id AS asset_id, a.file_name, e.event_type, e.occurred_at
+            FROM custody_entries e
+            JOIN original_assets a ON a.id = e.subject_id
+            WHERE e.subject_type = 'asset' AND a.owner = :owner
+              AND e.event_type = ANY(:types)
+            ORDER BY e.occurred_at DESC
+            LIMIT 20
+        """),
+        {"owner": owner, "types": list(ACTIVITY_EVENTS)},
+    ).fetchall()
+
+    items = [
+        {
+            "kind": "check",
+            "asset_id": str(r.asset_id),
+            "original_name": r.file_name,
+            "verdict": r.verdict,
+            "message": "Someone checked a copy of this original",
+            "at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in checks
+    ] + [
+        {
+            "kind": "similar",
+            "asset_id": str(r.asset_id),
+            "original_name": r.file_name,
+            "message": ACTIVITY_EVENTS[r.event_type],
+            "at": r.occurred_at.isoformat() if r.occurred_at else None,
+        }
+        for r in events
+    ]
+    items.sort(key=lambda item: item["at"] or "", reverse=True)
+    return {"activity": items[:20]}

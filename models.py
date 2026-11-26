@@ -3,6 +3,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     Column,
     DateTime,
     ForeignKey,
@@ -38,6 +39,9 @@ class OriginalAsset(Base):
     # Context recorded at registration, every section labelled by its source
     # (server clock, file EXIF/XMP, browser, opt-in location). See metadata.py.
     registration_metadata = Column(JSONB, nullable=True)
+    # The owner's choice to show this original to anyone whose check matches
+    # it. Off by default: originals are private unless their owner says so.
+    public_original = Column(Boolean, nullable=False, default=False, server_default="false")
 
 
 class EvidenceCheck(Base):
