@@ -16,6 +16,27 @@ ALTER TABLE custody_entries
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_custody_seq ON custody_entries (seq);
 
+-- Per-account ownership. original_assets is NOT NULL because registering
+-- requires an account; evidence_checks allows NULL for anonymous public checks.
+-- The NOT NULL is added only when every row already has an owner, so this file
+-- stays safe to re-run against older data.
+ALTER TABLE original_assets ADD COLUMN IF NOT EXISTS owner VARCHAR(128);
+ALTER TABLE evidence_checks ADD COLUMN IF NOT EXISTS owner VARCHAR(128);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM original_assets WHERE owner IS NULL) THEN
+        ALTER TABLE original_assets ALTER COLUMN owner SET NOT NULL;
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS ix_original_assets_owner ON original_assets (owner);
+
+-- The earlier, similar original this one was registered after (see models.py).
+ALTER TABLE original_assets
+    ADD COLUMN IF NOT EXISTS similar_to UUID REFERENCES original_assets (id);
+CREATE INDEX IF NOT EXISTS ix_evidence_checks_owner ON evidence_checks (owner);
+
 -- ---------------------------------------------------------------------------
 -- custody_entries is append-only.
 --
