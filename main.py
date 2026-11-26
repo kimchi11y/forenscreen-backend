@@ -125,7 +125,9 @@ import matching
 import metadata
 import report_pdf
 from database import SessionLocal, ensure_schema, get_db
-from models import Case, CaseItem, CustodyEntry, EvidenceCheck, OriginalAsset, ShareLink
+from models import (
+    Case, CaseItem, CustodyEntry, EvidenceCheck, ExtensionToken, OriginalAsset, ShareLink,
+)
 from pydantic import BaseModel
 
 # Pillow does not decode HEIC/HEIF files unless this plugin is registered.
@@ -2291,3 +2293,105 @@ def shared_difference_overlay(token: str, db: Session = Depends(get_db)):
     if overlay_path is None:
         raise HTTPException(status_code=404, detail="No difference overlay for this check.")
     return FileResponse(overlay_path, media_type="image/png")
+
+
+# ---------------------------------------------------------------------------
+# Browser extension tokens
+# ---------------------------------------------------------------------------
+# The extension signs in with the same account as the web app: a signed-in
+# user opens the web app's "Connect extension" page, which asks for a token
+# here and hands it to the extension. Web-app tokens last 15 minutes; these
+# last EXTENSION_TOKEN_DAYS, but auth.py lets them call only the routes in
+# auth.EXTENSION_ALLOWED_PATHS (register an original, ask who you are). Only a
+# SHA-256 is stored, and the user can revoke them from the same page.
+
+EXTENSION_TOKEN_DAYS = 90
+
+
+class ExtensionTokenRequest(BaseModel):
+    label: str | None = None
+
+
+def _resolve_extension_token(token: str) -> dict | None:
+    """auth.py's lookup for an extension token: claims, or None if invalid."""
+    db = SessionLocal()
+    try:
+        row = (
+            db.query(ExtensionToken)
+            .filter(ExtensionToken.token_sha256 == _token_hash(token))
+            .first()
+        )
+        if row is None or row.revoked_at is not None or row.expires_at <= datetime.utcnow():
+            return None
+        row.last_used_at = datetime.utcnow()
+        db.commit()
+        # Owners are stored as auth.actor_from() spells them: "user:<id>".
+        return {"sub": row.owner.removeprefix("user:"), "token_type": "extension"}
+    finally:
+        db.close()
+
+
+auth.set_extension_resolver(_resolve_extension_token)
+
+
+def _extension_token_summary(row: ExtensionToken) -> dict:
+    def iso(value):
+        return value.isoformat() if value else None
+
+    return {
+        "id": str(row.id),
+        "label": row.label,
+        "created_at": iso(row.created_at),
+        "expires_at": iso(row.expires_at),
+        "last_used_at": iso(row.last_used_at),
+        "active": row.revoked_at is None and row.expires_at > datetime.utcnow(),
+    }
+
+
+@app.post("/extension-tokens", status_code=status.HTTP_201_CREATED)
+def create_extension_token(
+    request: ExtensionTokenRequest,
+    user: dict = Depends(auth.require_user),
+    db: Session = Depends(get_db),
+):
+    """Issue a token for the extension. Returned once; only its hash is kept.
+
+    An extension token cannot reach this route (auth.py refuses it), so a
+    token can never be used to mint more tokens.
+    """
+    token = auth.EXTENSION_TOKEN_PREFIX + secrets.token_urlsafe(32)
+    row = ExtensionToken(
+        owner=_owner(user),
+        token_sha256=_token_hash(token),
+        label=(request.label or "Browser extension").strip()[:80],
+        expires_at=datetime.utcnow() + timedelta(days=EXTENSION_TOKEN_DAYS),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {**_extension_token_summary(row), "token": token}
+
+
+@app.get("/extension-tokens")
+def list_extension_tokens(user: dict = Depends(auth.require_user), db: Session = Depends(get_db)):
+    rows = (
+        db.query(ExtensionToken)
+        .filter(ExtensionToken.owner == _owner(user))
+        .order_by(ExtensionToken.created_at.desc())
+        .all()
+    )
+    return {"tokens": [_extension_token_summary(row) for row in rows]}
+
+
+@app.delete("/extension-tokens/{token_id}")
+def revoke_extension_token(
+    token_id: str, user: dict = Depends(auth.require_user), db: Session = Depends(get_db)
+):
+    _parse_uuid(token_id, "token id")
+    row = db.get(ExtensionToken, uuid.UUID(token_id))
+    if row is None or row.owner != _owner(user):
+        raise HTTPException(status_code=404, detail="Token not found.")
+    if row.revoked_at is None:
+        row.revoked_at = datetime.utcnow()
+        db.commit()
+    return _extension_token_summary(row)

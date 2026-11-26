@@ -153,3 +153,24 @@ class ShareLink(Base):
     revoked_at = Column(DateTime, nullable=True)
     view_count = Column(Integer, nullable=False, default=0)
     last_viewed_at = Column(DateTime, nullable=True)
+
+
+class ExtensionToken(Base):
+    """A long-lived sign-in for the browser extension, issued from the web app.
+
+    The web app's own tokens last 15 minutes, too short for an extension. This
+    one lasts longer but can do one thing only - register originals (see
+    auth.EXTENSION_ALLOWED_PATHS) - so a stolen token cannot read anything.
+    Only a SHA-256 of it is stored, and it can be revoked.
+    """
+
+    __tablename__ = "extension_tokens"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    owner = Column(String(128), nullable=False, index=True)
+    token_sha256 = Column(String(64), nullable=False, unique=True)
+    label = Column(String(80), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    last_used_at = Column(DateTime, nullable=True)
+    revoked_at = Column(DateTime, nullable=True)
