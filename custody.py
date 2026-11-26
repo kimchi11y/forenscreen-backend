@@ -50,6 +50,7 @@ CASE_ATTACHED = "CASE_ATTACHED"
 CASE_DETACHED = "CASE_DETACHED"
 SHARE_LINK_CREATED = "SHARE_LINK_CREATED"
 SHARE_LINK_REVOKED = "SHARE_LINK_REVOKED"
+ORIGINAL_VISIBILITY_CHANGED = "ORIGINAL_VISIBILITY_CHANGED"
 REPORT_EXPORTED = "REPORT_EXPORTED"
 NOTE_ADDED = "NOTE_ADDED"
 # Written to an original's log when another account registers a similar picture.
@@ -81,6 +82,7 @@ EVENT_LABELS = {
     CASE_DETACHED: "Removed from a case",
     SHARE_LINK_CREATED: "Share link created",
     SHARE_LINK_REVOKED: "Share link revoked",
+    ORIGINAL_VISIBILITY_CHANGED: "Public visibility changed",
     REPORT_EXPORTED: "Report exported",
     NOTE_ADDED: "Note added",
     SIMILAR_REGISTERED: "Similar image registered by another account",

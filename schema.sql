@@ -40,6 +40,10 @@ ALTER TABLE original_assets
 -- Registration context, labelled by source (see metadata.py).
 ALTER TABLE original_assets ADD COLUMN IF NOT EXISTS registration_metadata JSONB;
 
+-- Owner's opt-in to show the original in other people's checks (see models.py).
+ALTER TABLE original_assets
+    ADD COLUMN IF NOT EXISTS public_original BOOLEAN NOT NULL DEFAULT false;
+
 -- ---------------------------------------------------------------------------
 -- custody_entries is append-only.
 --
