@@ -2,7 +2,7 @@ from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import uuid
 from PIL import Image
 from PIL import UnidentifiedImageError
@@ -11,6 +11,8 @@ import io
 import imagehash
 from pillow_heif import register_heif_opener
 import mimetypes
+import secrets
+import os
 from pathlib import Path
 import json
 from sqlalchemy import text
@@ -81,6 +83,17 @@ def analyze_screenshot_forensics(image_content: bytes) -> dict:
             "megapixels": round((image.width * image.height) / 1000000, 2)
         }
 
+        # What the file says about itself: editing software, capture and
+        # modification times. Hints for a reviewer, never part of the verdict.
+        # GPS is reported only as present or not - this response may go to
+        # anyone, and the uploader did not choose to share a location.
+        file_meta = metadata.read_file_metadata(image_content)
+        file_meta.pop("_gps", None)
+        forensic_data["file_metadata"] = file_meta
+        forensic_data["metadata_signals"] = metadata.signals(
+            file_meta, datetime.now(timezone.utc)
+        )
+
         # File timeline data
         forensic_data["timeline_data"] = {
             "analysis_timestamp": datetime.now().isoformat(),
@@ -109,8 +122,13 @@ import auth
 import blockchain
 import custody
 import matching
+import metadata
+import report_pdf
 from database import SessionLocal, ensure_schema, get_db
-from models import CustodyEntry, EvidenceCheck, OriginalAsset
+from models import (
+    Case, CaseItem, CustodyEntry, EvidenceCheck, ExtensionToken, OriginalAsset, ShareLink,
+)
+from pydantic import BaseModel
 
 # Pillow does not decode HEIC/HEIF files unless this plugin is registered.
 register_heif_opener()
@@ -184,7 +202,7 @@ def _describe_matches(db: Session, matched: dict | None, user: dict | None):
 
     rows = db.execute(
         text("""
-            SELECT id, owner, created_at FROM original_assets
+            SELECT id, owner, created_at, public_original FROM original_assets
             WHERE id = ANY(CAST(:ids AS uuid[]))
         """),
         {"ids": ids},
@@ -196,6 +214,9 @@ def _describe_matches(db: Session, matched: dict | None, user: dict | None):
         row = by_id.get(str(entry.get("original_asset_id")))
         is_owner = row is not None and me is not None and row.owner == me
         entry["is_owner"] = is_owner
+        # The owner may choose to show the original to everyone (E2). The
+        # filename stays private either way.
+        entry["original_public"] = bool(row is not None and row.public_original)
         entry["registered_at"] = (
             row.created_at.isoformat() if row is not None and row.created_at else None
         )
@@ -236,28 +257,38 @@ async def _similar_originals(
         },
     ).fetchall()
 
-    payload = []
-    for candidate in candidates:
-        blob = db.execute(
-            text("SELECT file_data FROM original_assets WHERE id = :id"),
-            {"id": candidate.id},
-        ).fetchone()
-        if blob is None or blob.file_data is None:
-            continue
-        payload.append({
-            "id": candidate.id,
-            "file_name": candidate.file_name,
-            "sha256_hash": candidate.sha256_hash,
-            "phash_distance": int(candidate.distance),
-            "file_data": bytes(blob.file_data),
-        })
-    if not payload:
+    payload = _candidate_payload(db, candidates)
+    ranked = (
+        await run_in_threadpool(matching.rank_candidates, image_bytes, payload)
+        if payload
+        else []
+    )
+    winners = [r for r in ranked if r["ok"]]
+
+    # Same wider pass as a check (see PHASH_WIDE_LIMIT): a cropped copy of
+    # someone else's screenshot must not slip past this warning either.
+    if not winners:
+        wider = _wider_candidates(
+            db, query_phash, [c.id for c in candidates],
+            "AND owner <> :owner AND similar_to IS NULL", {"owner": owner},
+        )
+        wide_payload = _candidate_payload(db, wider)
+        wide_ranked = (
+            await run_in_threadpool(matching.rank_candidates, image_bytes, wide_payload)
+            if wide_payload
+            else []
+        )
+        candidates = list(candidates) + list(wider)
+        payload += wide_payload
+        winners = sorted(
+            (r for r in wide_ranked if r["ok"]),
+            key=lambda r: (-r["inliers"], -r["inlier_ratio"]),
+        )
+    if not winners:
         return []
 
-    ranked = await run_in_threadpool(matching.rank_candidates, image_bytes, payload)
     registered = {str(c.id): c.created_at for c in candidates}
     data = {str(p["id"]): p["file_data"] for p in payload}
-    winners = [r for r in ranked if r["ok"]]
     for winner in winners:
         winner["registered_at"] = registered.get(str(winner["original_asset_id"]))
         winner["file_data"] = data.get(str(winner["original_asset_id"]))
@@ -298,10 +329,15 @@ async def upload_original_asset(
     # Sent as true once the user has seen the "a similar image is already
     # registered" warning and chosen to register anyway.
     confirm_similar: bool = Form(False),
+    # JSON from the register page: {"device": {...}, "location": {...}}. The
+    # location is present only when the user switched "Share my location" on.
+    client_metadata: str = Form(None),
     user: dict = Depends(auth.require_user),
     db: Session = Depends(get_db),
 ):
-    # 1. Read the raw incoming file data into memory
+    # 1. Read the raw incoming file data into memory. The receipt time is
+    #    taken first, from this server's clock, which the client cannot set.
+    received_at = datetime.now(timezone.utc)
     file_bytes = await file.read()
     
     if not file_bytes:
@@ -383,7 +419,14 @@ async def upload_original_asset(
             },
         )
 
-    # 6. Bind information to our database record
+    # 6. Context for the record, every value labelled by where it came from.
+    try:
+        client = json.loads(client_metadata) if client_metadata else None
+    except json.JSONDecodeError:
+        client = None
+    registration_metadata = metadata.build(file_bytes, client, received_at)
+
+    # 7. Bind information to our database record
     new_asset = OriginalAsset(
         file_name=file.filename,
         file_data=file_bytes, # Storing binary payload directly
@@ -391,6 +434,7 @@ async def upload_original_asset(
         sha256_hash=sha256_sig,
         owner=_owner(user),
         similar_to=earlier["original_asset_id"] if earlier else None,
+        registration_metadata=registration_metadata,
     )
 
     try:
@@ -413,6 +457,9 @@ async def upload_original_asset(
                 "actor_email": (user or {}).get("email"),
                 "similar_to": str(earlier["original_asset_id"]) if earlier else None,
                 "similarity_warning_accepted": earlier is not None,
+                # No coordinates: this log can never be cleared. The hash
+                # commits it to the full record stored on the asset.
+                "metadata": metadata.for_custody(registration_metadata),
             },
         )
 
@@ -462,7 +509,8 @@ async def upload_original_asset(
         "id": str(new_asset.id),
         "file_name": new_asset.file_name,
         "phash": new_asset.phash,
-        "sha256": new_asset.sha256_hash
+        "sha256": new_asset.sha256_hash,
+        "registration_metadata": new_asset.registration_metadata,
     }
 
 
@@ -497,12 +545,15 @@ def _existing_registration(existing: OriginalAsset, user: dict) -> JSONResponse:
 @app.get("/view-asset/{asset_id}")
 def get_asset_image(
     asset_id: str,
-    user: dict = Depends(auth.require_user),
+    user: dict | None = Depends(auth.optional_user),
     db: Session = Depends(get_db),
 ):
-    """A registered original's image, for its owner only."""
-    _require_asset_owner(db, asset_id, user)
+    """A registered original's image: for its owner, or for anyone if the
+    owner chose to show it in public checks."""
+    _parse_uuid(asset_id, "asset id")
     asset = db.query(OriginalAsset).filter(OriginalAsset.id == asset_id).first()
+    if asset is None or (asset.owner != _owner(user) and not asset.public_original):
+        raise HTTPException(status_code=404, detail="Asset not found.")
 
     # Stream binary data directly back out as a standard displayable JPEG/PNG
     return StreamingResponse(io.BytesIO(asset.file_data), media_type="image/jpeg")
@@ -513,6 +564,15 @@ def get_asset_image(
 # candidate here means it is never offered to the matcher.
 PHASH_PREFILTER_THRESHOLD = 24
 PHASH_PREFILTER_LIMIT = 5
+
+# A crop moves pHash a long way: measured on real screenshots, removing the
+# bottom 20% moved it 20-34 bits, past the shortlist above, so ORB never saw the
+# original and the crop came back "No match" - although ORB recognised every
+# one of them almost perfectly. So when the shortlist yields no match, ORB also
+# tries the next-nearest originals regardless of distance. Only checks that are
+# still unmatched pay for this. In a registry much larger than this limit, a
+# heavily cropped copy can still be missed.
+PHASH_WIDE_LIMIT = 15
 
 # Still used as the fallback signal when ORB cannot judge a candidate at all
 # (texture-poor image), where a strict distance is the right thing to demand.
@@ -530,6 +590,48 @@ ORB_UNVERIFIABLE = {
     "homography_failed",
     "undecodable_original",
 }
+
+
+def _candidate_payload(db: Session, candidates) -> list[dict]:
+    """Load the image bytes for shortlisted originals, in the shape ORB takes."""
+    payload = []
+    for candidate in candidates:
+        blob = db.execute(
+            text("SELECT file_data FROM original_assets WHERE id = :id"),
+            {"id": candidate.id},
+        ).fetchone()
+        if blob is None or blob.file_data is None:
+            continue
+        payload.append({
+            "id": candidate.id,
+            "file_name": candidate.file_name,
+            "sha256_hash": candidate.sha256_hash,
+            "phash_distance": int(candidate.distance),
+            "file_data": bytes(blob.file_data),
+        })
+    return payload
+
+
+def _wider_candidates(
+    db: Session, query_phash: str, exclude_ids, extra_where: str = "", params: dict | None = None
+):
+    """The next-nearest originals by pHash, past the shortlist's threshold."""
+    return db.execute(
+        text(f"""
+            SELECT id, file_name, phash, sha256_hash, created_at,
+                   BIT_COUNT(('x' || phash)::bit(64) # ('x' || :query_phash)::bit(64)) AS distance
+            FROM original_assets
+            WHERE NOT (id = ANY(CAST(:exclude AS uuid[]))) {extra_where}
+            ORDER BY distance ASC
+            LIMIT :limit;
+        """),
+        {
+            "query_phash": query_phash,
+            "exclude": [str(i) for i in exclude_ids],
+            "limit": PHASH_WIDE_LIMIT,
+            **(params or {}),
+        },
+    ).fetchall()
 
 
 @app.post("/upload")
@@ -552,6 +654,14 @@ async def upload_evidence(
     and cryptographic integrity checking using Approach A.
     """
     results = []
+
+    # A check run from inside a case is filed into it. Checked up front, so a
+    # bad case id fails before any work is done.
+    case = None
+    if case_id:
+        case = _require_case_owner(db, case_id, user)
+        if case.status != "open":
+            raise HTTPException(status_code=409, detail="This case is closed. Reopen it to add evidence.")
 
     # Parse submitter metadata if provided
     metadata = {}
@@ -683,21 +793,7 @@ async def upload_evidence(
                 # 3. Load the candidate bytes. Fetched here rather than in the
                 #    search above so we do not pull megabytes of BYTEA for
                 #    candidates that ORB is never going to look at.
-                payload = []
-                for candidate in candidates:
-                    blob = db.execute(
-                        text("SELECT file_data FROM original_assets WHERE id = :id"),
-                        {"id": candidate.id},
-                    ).fetchone()
-                    if blob is None or blob.file_data is None:
-                        continue
-                    payload.append({
-                        "id": candidate.id,
-                        "file_name": candidate.file_name,
-                        "sha256_hash": candidate.sha256_hash,
-                        "phash_distance": int(candidate.distance),
-                        "file_data": bytes(blob.file_data),
-                    })
+                payload = _candidate_payload(db, candidates)
 
                 # 4. ORB + RANSAC decides. CPU-bound, so it goes to a worker
                 #    thread instead of blocking the event loop.
@@ -710,6 +806,46 @@ async def upload_evidence(
                 )
 
                 winners = [r for r in ranked if r["ok"]]
+
+                # 4b. Nothing on the shortlist: a crop may simply have moved
+                #     pHash past it. Try the next-nearest originals too; their
+                #     results are only kept if one of them really matches.
+                if not winners and not original_asset_id:
+                    wide_payload = _candidate_payload(
+                        db, _wider_candidates(db, computed_phash, [c.id for c in candidates])
+                    )
+                    wide_ranked = (
+                        await run_in_threadpool(
+                            matching.rank_candidates, file_content, wide_payload
+                        )
+                        if wide_payload
+                        else []
+                    )
+                    if any(r["ok"] for r in wide_ranked):
+                        payload += wide_payload
+                        ranked = sorted(
+                            ranked + wide_ranked,
+                            key=lambda r: (-r["inliers"], -r["inlier_ratio"]),
+                        )
+                        winners = [r for r in ranked if r["ok"]]
+
+                # 4c. A registration flagged as made after a similar earlier
+                #     original is nobody's baseline while an unflagged original
+                #     also matches: a re-shared copy of a fake should be judged
+                #     against the real original, not against the fake (E4).
+                if len(winners) >= 2:
+                    flagged = {
+                        str(r.id) for r in db.execute(
+                            text("""
+                                SELECT id FROM original_assets
+                                WHERE id = ANY(CAST(:ids AS uuid[])) AND similar_to IS NOT NULL
+                            """),
+                            {"ids": [str(w["original_asset_id"]) for w in winners]},
+                        ).fetchall()
+                    }
+                    unflagged = [w for w in winners if str(w["original_asset_id"]) not in flagged]
+                    if unflagged:
+                        winners = unflagged
 
                 if (
                     len(winners) >= 2
@@ -871,6 +1007,8 @@ async def upload_evidence(
                         "saved_filename": saved_filename,
                     },
                 )
+                if case is not None:
+                    _attach(db, case, custody.SUBJECT_EVIDENCE, file_id, user)
                 file_path.write_bytes(file_content)
                 db.commit()
                 file_result["persisted"] = True
@@ -1014,7 +1152,8 @@ def list_assets(
     owner = _owner(user)
     rows = db.execute(
         text("""
-            SELECT id, file_name, phash, sha256_hash, created_at
+            SELECT id, file_name, phash, sha256_hash, created_at, registration_metadata,
+                   public_original
             FROM original_assets
             WHERE owner = :owner
             ORDER BY created_at DESC
@@ -1040,6 +1179,8 @@ def list_assets(
                 "sha256": row.sha256_hash,
                 "created_at": row.created_at.isoformat() if row.created_at else None,
                 "image_url": f"/view-asset/{row.id}",
+                "registration_metadata": row.registration_metadata,
+                "public_original": row.public_original,
             }
             for row in rows
         ],
@@ -1056,7 +1197,7 @@ def list_assets(
 # (evidence, original), so the second and later requests are free.
 
 def _load_verified_evidence(
-    file_id: str, db: Session, user: dict | None
+    file_id: str, db: Session, user: dict | None, check_access: bool = True
 ) -> tuple[bytes, str]:
     """Return (bytes, saved_filename) for a stored evidence copy, verified.
 
@@ -1068,8 +1209,14 @@ def _load_verified_evidence(
 
     The id arrives from the client, so it is validated as a UUID first - that
     removes any possibility of a crafted value escaping the uploads directory.
+
+    `check_access=False` is only for a share link, which is itself the
+    permission and has already been validated.
     """
-    _require_check_access(db, file_id, user)
+    if check_access:
+        _require_check_access(db, file_id, user)
+    else:
+        _parse_uuid(file_id, "evidence id")
 
     row = db.execute(
         text("SELECT sha256_hash, saved_filename FROM evidence_checks WHERE id = :id"),
@@ -1112,7 +1259,8 @@ def get_evidence_image(
 
 
 def _build_difference_artifacts(
-    file_id: str, original_asset_id: str, db: Session, user: dict | None
+    file_id: str, original_asset_id: str, db: Session, user: dict | None,
+    check_access: bool = True,
 ):
     """Return (payload, overlay_path|None) for one evidence/original pair."""
     try:
@@ -1122,7 +1270,7 @@ def _build_difference_artifacts(
 
     # Verified before the cache is consulted: the overlay is a picture of the
     # evidence, so it must not be shown once the evidence itself fails.
-    evidence_bytes, _ = _load_verified_evidence(file_id, db, user)
+    evidence_bytes, _ = _load_verified_evidence(file_id, db, user, check_access)
 
     regions_path = UPLOAD_DIR / f"{file_id}__{original_asset_id}__regions.json"
     overlay_path = UPLOAD_DIR / f"{file_id}__{original_asset_id}__overlay.png"
@@ -1527,19 +1675,8 @@ def verify_anchor(
     }
 
 
-@app.post("/checks/{check_id}/report")
-def export_check_report(
-    check_id: str,
-    user: dict | None = Depends(auth.optional_user),
-    db: Session = Depends(get_db),
-):
-    """Produce a report for one check, and record that it was exported.
-
-    Exporting is itself a custody event: a copy leaving the system is exactly
-    the kind of thing a chain of custody exists to record. The report embeds the
-    custody chain and its verification result, so the document carries its own
-    evidence of completeness instead of asserting it.
-    """
+def _gather_report(db: Session, check_id: str, user: dict | None) -> dict:
+    """The report for one check, without recording anything yet."""
     _require_check_access(db, check_id, user)
 
     row = db.execute(
@@ -1560,8 +1697,44 @@ def export_check_report(
         raise HTTPException(status_code=404, detail="Check not found.")
 
     entries = custody.list_entries(db, custody.SUBJECT_EVIDENCE, check_id)
-    chain = custody.verify_chain(entries)
+    return {
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "generated_by": auth.actor_from(user),
+        "check": {
+            "id": str(row.id),
+            "sha256": row.sha256_hash,
+            "phash": row.phash,
+            "verdict": row.verdict,
+            "match_method": row.match_method,
+            "orb_inliers": row.orb_inliers,
+            "orb_inlier_ratio": (
+                float(row.orb_inlier_ratio) if row.orb_inlier_ratio is not None else None
+            ),
+            "phash_distance": row.phash_distance,
+            "saved_filename": row.saved_filename,
+            "checked_at": row.created_at.isoformat() if row.created_at else None,
+            "matched_asset": (
+                {
+                    "id": str(row.asset_id),
+                    "file_name": row.asset_name,
+                    "sha256": row.asset_sha256,
+                    "registered_at": (
+                        row.asset_registered_at.isoformat()
+                        if row.asset_registered_at
+                        else None
+                    ),
+                }
+                if row.asset_id
+                else None
+            ),
+        },
+        "custody": {"chain": custody.verify_chain(entries), "entries": entries},
+    }
 
+
+def _record_export(db: Session, check_id: str, user: dict | None, report: dict, fmt: str) -> None:
+    """Exporting is itself a custody event: a copy leaving the system is
+    exactly what a chain of custody exists to record."""
     custody.append_entry(
         db,
         subject_type=custody.SUBJECT_EVIDENCE,
@@ -1569,48 +1742,72 @@ def export_check_report(
         event_type=custody.REPORT_EXPORTED,
         actor=auth.actor_from(user),
         payload={
-            "verdict": row.verdict,
-            "custody_entries": len(entries),
-            "chain_head": chain.get("head_hash"),
+            "verdict": report["check"]["verdict"],
+            "custody_entries": len(report["custody"]["entries"]),
+            "chain_head": report["custody"]["chain"].get("head_hash"),
+            "format": fmt,
         },
     )
     db.commit()
 
-    return {
-        "report": {
-            "generated_at": datetime.utcnow().isoformat() + "Z",
-            "generated_by": auth.actor_from(user),
-            "check": {
-                "id": str(row.id),
-                "sha256": row.sha256_hash,
-                "phash": row.phash,
-                "verdict": row.verdict,
-                "match_method": row.match_method,
-                "orb_inliers": row.orb_inliers,
-                "orb_inlier_ratio": (
-                    float(row.orb_inlier_ratio) if row.orb_inlier_ratio is not None else None
-                ),
-                "phash_distance": row.phash_distance,
-                "saved_filename": row.saved_filename,
-                "checked_at": row.created_at.isoformat() if row.created_at else None,
-                "matched_asset": (
-                    {
-                        "id": str(row.asset_id),
-                        "file_name": row.asset_name,
-                        "sha256": row.asset_sha256,
-                        "registered_at": (
-                            row.asset_registered_at.isoformat()
-                            if row.asset_registered_at
-                            else None
-                        ),
-                    }
-                    if row.asset_id
-                    else None
-                ),
-            },
-            "custody": {"chain": chain, "entries": entries},
-        }
-    }
+
+@app.post("/checks/{check_id}/report")
+def export_check_report(
+    check_id: str,
+    user: dict | None = Depends(auth.optional_user),
+    db: Session = Depends(get_db),
+):
+    """Produce a report for one check, and record that it was exported.
+
+    The report embeds the custody chain and its verification result, so the
+    document carries its own evidence of completeness instead of asserting it.
+    """
+    report = _gather_report(db, check_id, user)
+    _record_export(db, check_id, user, report, "json")
+    return {"report": report}
+
+
+@app.post("/checks/{check_id}/report.pdf")
+def export_check_report_pdf(
+    check_id: str,
+    user: dict | None = Depends(auth.optional_user),
+    db: Session = Depends(get_db),
+):
+    """The same report as a PDF, with the evidence image and the heatmap.
+
+    The PDF is rendered before the export is recorded, so a rendering failure
+    never leaves a custody entry claiming an export that did not happen.
+    """
+    report = _gather_report(db, check_id, user)
+    check = report["check"]
+    matched = check["matched_asset"]
+
+    try:
+        evidence_image, _ = _load_verified_evidence(check_id, db, user)
+    except HTTPException:
+        evidence_image = None  # missing, or failed its integrity check: said so in the PDF
+
+    overlay_image = None
+    if evidence_image and matched and check["verdict"] in ("TAMPERED_MANIPULATED", "EARLIER_ORIGINAL_EXISTS"):
+        try:
+            _, overlay_path = _build_difference_artifacts(check_id, matched["id"], db, user)
+            overlay_image = overlay_path.read_bytes() if overlay_path else None
+        except HTTPException:
+            overlay_image = None
+
+    anchor = blockchain.get_anchor(matched["sha256"]) if matched and matched.get("sha256") else None
+    pdf = report_pdf.render(
+        report, evidence_image, overlay_image, anchor, os.getenv("REGISTRY_CONTRACT_ADDRESS")
+    )
+
+    _record_export(db, check_id, user, report, "pdf")
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="forenscreen-report-{check_id[:8]}.pdf"'
+        },
+    )
 
 
 @app.get("/checks/{check_id}")
@@ -1627,7 +1824,8 @@ def get_check(
             SELECT c.id, c.asset_id, c.sha256_hash, c.phash, c.verdict, c.match_method,
                    c.orb_inliers, c.orb_inlier_ratio, c.phash_distance,
                    c.saved_filename, c.created_at,
-                   a.owner AS asset_owner, a.created_at AS asset_registered_at
+                   a.owner AS asset_owner, a.created_at AS asset_registered_at,
+                   a.public_original AS asset_public
             FROM evidence_checks c
             LEFT JOIN original_assets a ON a.id = c.asset_id
             WHERE c.id = :id
@@ -1642,6 +1840,7 @@ def get_check(
         "file_id": str(row.id),
         "asset_id": str(row.asset_id) if row.asset_id else None,
         "asset_is_owner": row.asset_id is not None and row.asset_owner == _owner(user),
+        "asset_public": bool(row.asset_public),
         "asset_registered_at": (
             row.asset_registered_at.isoformat() if row.asset_registered_at else None
         ),
@@ -1657,3 +1856,669 @@ def get_check(
         "saved_filename": row.saved_filename,
         "created_at": row.created_at.isoformat() if row.created_at else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# Cases
+# ---------------------------------------------------------------------------
+# A case groups one incident's originals and checks (FYP1 ERD). Like everything
+# else it is visible to its owner only, and only the owner's own originals and
+# checks can be put in it. Adding or removing an item is recorded in that
+# item's custody log, so the log shows which incident the evidence was used in.
+# Cases are closed, never deleted, because those log entries refer to them.
+
+CASE_STATUSES = {"open", "closed"}
+
+
+class CaseFields(BaseModel):
+    title: str | None = None
+    summary: str | None = None
+    status: str | None = None
+
+
+class CaseItemRef(BaseModel):
+    subject_type: str
+    subject_id: str
+
+
+def _clean_case_fields(fields: CaseFields, creating: bool) -> dict:
+    values = {}
+    if fields.title is not None or creating:
+        title = (fields.title or "").strip()
+        if not 1 <= len(title) <= 120:
+            raise HTTPException(status_code=400, detail="A case needs a title of 1-120 characters.")
+        values["title"] = title
+    if fields.summary is not None:
+        summary = fields.summary.strip()
+        if len(summary) > 2000:
+            raise HTTPException(status_code=400, detail="The summary can be at most 2000 characters.")
+        values["summary"] = summary or None
+    if fields.status is not None:
+        if fields.status not in CASE_STATUSES:
+            raise HTTPException(status_code=400, detail="Status must be 'open' or 'closed'.")
+        values["status"] = fields.status
+    return values
+
+
+def _require_case_owner(db: Session, case_id: str, user: dict | None) -> Case:
+    _parse_uuid(case_id, "case id")
+    case = db.get(Case, uuid.UUID(case_id))
+    if case is None or case.owner != _owner(user):
+        raise HTTPException(status_code=404, detail="Case not found.")
+    return case
+
+
+def _require_owned_item(db: Session, subject_type: str, subject_id: str, user: dict) -> None:
+    """An item may go in a case only if the caller owns it."""
+    _validate_subject(subject_type, subject_id)
+    table = "original_assets" if subject_type == custody.SUBJECT_ASSET else "evidence_checks"
+    owner = db.execute(
+        text(f"SELECT owner FROM {table} WHERE id = :id"), {"id": subject_id}
+    ).scalar()
+    if owner is None or owner != _owner(user):
+        raise HTTPException(status_code=404, detail="Item not found.")
+
+
+def _attach(db: Session, case: Case, subject_type: str, subject_id: str, user: dict) -> bool:
+    """Put an item in a case and log it. False if it was already there."""
+    key = (case.id, subject_type, uuid.UUID(subject_id))
+    if db.get(CaseItem, key) is not None:
+        return False
+    db.add(CaseItem(case_id=case.id, subject_type=subject_type, subject_id=key[2]))
+    custody.append_entry(
+        db,
+        subject_type=subject_type,
+        subject_id=key[2],
+        event_type=custody.CASE_ATTACHED,
+        actor=auth.actor_from(user),
+        payload={"case_id": str(case.id), "case_title": case.title},
+    )
+    return True
+
+
+def _case_summary(case: Case, counts: dict | None = None) -> dict:
+    counts = counts or {}
+    return {
+        "id": str(case.id),
+        "title": case.title,
+        "summary": case.summary,
+        "status": case.status,
+        "created_at": case.created_at.isoformat() if case.created_at else None,
+        "originals": counts.get(custody.SUBJECT_ASSET, 0),
+        "checks": counts.get(custody.SUBJECT_EVIDENCE, 0),
+    }
+
+
+@app.get("/cases")
+def list_cases(user: dict = Depends(auth.require_user), db: Session = Depends(get_db)):
+    """The caller's cases, newest first, with how many items each holds."""
+    cases = (
+        db.query(Case).filter(Case.owner == _owner(user)).order_by(Case.created_at.desc()).all()
+    )
+    rows = db.execute(
+        text("""
+            SELECT i.case_id, i.subject_type, count(*) AS n
+            FROM case_items i JOIN cases c ON c.id = i.case_id
+            WHERE c.owner = :owner
+            GROUP BY i.case_id, i.subject_type
+        """),
+        {"owner": _owner(user)},
+    ).fetchall()
+    counts: dict = {}
+    for row in rows:
+        counts.setdefault(row.case_id, {})[row.subject_type] = row.n
+    return {"cases": [_case_summary(case, counts.get(case.id)) for case in cases]}
+
+
+@app.post("/cases", status_code=status.HTTP_201_CREATED)
+def create_case(
+    fields: CaseFields, user: dict = Depends(auth.require_user), db: Session = Depends(get_db)
+):
+    values = _clean_case_fields(fields, creating=True)
+    values.pop("status", None)  # a new case is always open
+    case = Case(owner=_owner(user), status="open", **values)
+    db.add(case)
+    db.commit()
+    db.refresh(case)
+    return _case_summary(case)
+
+
+@app.get("/cases/{case_id}")
+def get_case(case_id: str, user: dict = Depends(auth.require_user), db: Session = Depends(get_db)):
+    """One case with its items, oldest first."""
+    case = _require_case_owner(db, case_id, user)
+    assets = db.execute(
+        text("""
+            SELECT a.id, a.file_name, a.sha256_hash, a.created_at, i.added_at
+            FROM case_items i JOIN original_assets a ON a.id = i.subject_id
+            WHERE i.case_id = :case_id AND i.subject_type = 'asset'
+            ORDER BY i.added_at
+        """),
+        {"case_id": case_id},
+    ).fetchall()
+    checks = db.execute(
+        text("""
+            SELECT c.id, c.verdict, c.sha256_hash, c.created_at, i.added_at,
+                   CASE WHEN a.owner = :owner THEN a.file_name END AS asset_name
+            FROM case_items i
+            JOIN evidence_checks c ON c.id = i.subject_id
+            LEFT JOIN original_assets a ON a.id = c.asset_id
+            WHERE i.case_id = :case_id AND i.subject_type = 'evidence'
+            ORDER BY i.added_at
+        """),
+        {"case_id": case_id, "owner": _owner(user)},
+    ).fetchall()
+
+    def iso(value):
+        return value.isoformat() if value else None
+
+    return {
+        **_case_summary(case, {"asset": len(assets), "evidence": len(checks)}),
+        "items": {
+            "originals": [
+                {"id": str(r.id), "file_name": r.file_name, "sha256": r.sha256_hash,
+                 "registered_at": iso(r.created_at), "added_at": iso(r.added_at)}
+                for r in assets
+            ],
+            "checks": [
+                {"id": str(r.id), "verification_status": r.verdict, "sha256": r.sha256_hash,
+                 "matched_asset_name": r.asset_name, "checked_at": iso(r.created_at),
+                 "added_at": iso(r.added_at)}
+                for r in checks
+            ],
+        },
+    }
+
+
+@app.patch("/cases/{case_id}")
+def update_case(
+    case_id: str,
+    fields: CaseFields,
+    user: dict = Depends(auth.require_user),
+    db: Session = Depends(get_db),
+):
+    """Rename, re-describe, close or reopen a case."""
+    case = _require_case_owner(db, case_id, user)
+    for name, value in _clean_case_fields(fields, creating=False).items():
+        setattr(case, name, value)
+    db.commit()
+    db.refresh(case)
+    return _case_summary(case)
+
+
+@app.post("/cases/{case_id}/items")
+def add_case_item(
+    case_id: str,
+    item: CaseItemRef,
+    user: dict = Depends(auth.require_user),
+    db: Session = Depends(get_db),
+):
+    case = _require_case_owner(db, case_id, user)
+    if case.status != "open":
+        raise HTTPException(status_code=409, detail="This case is closed. Reopen it to add evidence.")
+    _require_owned_item(db, item.subject_type, item.subject_id, user)
+    added = _attach(db, case, item.subject_type, item.subject_id, user)
+    db.commit()
+    return {"added": added}
+
+
+@app.delete("/cases/{case_id}/items/{subject_type}/{subject_id}")
+def remove_case_item(
+    case_id: str,
+    subject_type: str,
+    subject_id: str,
+    user: dict = Depends(auth.require_user),
+    db: Session = Depends(get_db),
+):
+    case = _require_case_owner(db, case_id, user)
+    _validate_subject(subject_type, subject_id)
+    row = db.get(CaseItem, (case.id, subject_type, uuid.UUID(subject_id)))
+    if row is None:
+        raise HTTPException(status_code=404, detail="That item is not in this case.")
+    db.delete(row)
+    custody.append_entry(
+        db,
+        subject_type=subject_type,
+        subject_id=uuid.UUID(subject_id),
+        event_type=custody.CASE_DETACHED,
+        actor=auth.actor_from(user),
+        payload={"case_id": str(case.id), "case_title": case.title},
+    )
+    db.commit()
+    return {"removed": True}
+
+
+# ---------------------------------------------------------------------------
+# Share links
+# ---------------------------------------------------------------------------
+# The owner of a check can give a link to someone without an account - the
+# police, a school - to see the result side by side with the original. It is
+# the safe way to show an original: the owner chooses who sees it.
+#
+# A link shows the original only when the check's owner also owns the matched
+# original. Sharing your check of someone else's screenshot never reveals their
+# picture. Only a SHA-256 of each link's secret is stored, links expire, and the
+# owner can revoke them. Creating and revoking are custody events; views are
+# counted on the link itself rather than logged, so a busy link cannot flood
+# the check's custody log.
+
+SHARE_DEFAULT_DAYS = 30
+SHARE_MAX_DAYS = 90
+
+
+class ShareRequest(BaseModel):
+    days: int = SHARE_DEFAULT_DAYS
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _share_summary(link: ShareLink) -> dict:
+    def iso(value):
+        return value.isoformat() if value else None
+
+    now = datetime.utcnow()
+    return {
+        "id": str(link.id),
+        "created_at": iso(link.created_at),
+        "expires_at": iso(link.expires_at),
+        "revoked_at": iso(link.revoked_at),
+        "active": link.revoked_at is None and link.expires_at > now,
+        "view_count": link.view_count,
+        "last_viewed_at": iso(link.last_viewed_at),
+    }
+
+
+def _require_own_check(db: Session, check_id: str, user: dict) -> None:
+    """Only a signed-in owner may share a check; anonymous checks have none."""
+    _parse_uuid(check_id, "check id")
+    owner = db.execute(
+        text("SELECT owner FROM evidence_checks WHERE id = :id"), {"id": check_id}
+    ).scalar()
+    if owner is None or owner != _owner(user):
+        raise HTTPException(status_code=404, detail="Check not found.")
+
+
+@app.post("/checks/{check_id}/share", status_code=status.HTTP_201_CREATED)
+def create_share_link(
+    check_id: str,
+    request: ShareRequest,
+    user: dict = Depends(auth.require_user),
+    db: Session = Depends(get_db),
+):
+    """Create a link. The secret is returned here once and never again."""
+    _require_own_check(db, check_id, user)
+    if not 1 <= request.days <= SHARE_MAX_DAYS:
+        raise HTTPException(status_code=400, detail=f"A link can last 1-{SHARE_MAX_DAYS} days.")
+
+    token = secrets.token_urlsafe(32)
+    link = ShareLink(
+        check_id=uuid.UUID(check_id),
+        owner=_owner(user),
+        token_sha256=_token_hash(token),
+        expires_at=datetime.utcnow() + timedelta(days=request.days),
+    )
+    db.add(link)
+    db.flush()
+    custody.append_entry(
+        db,
+        subject_type=custody.SUBJECT_EVIDENCE,
+        subject_id=uuid.UUID(check_id),
+        event_type=custody.SHARE_LINK_CREATED,
+        actor=auth.actor_from(user),
+        payload={"share_id": str(link.id), "expires_at": link.expires_at.isoformat()},
+    )
+    db.commit()
+    db.refresh(link)
+    return {**_share_summary(link), "token": token}
+
+
+@app.get("/checks/{check_id}/shares")
+def list_share_links(
+    check_id: str, user: dict = Depends(auth.require_user), db: Session = Depends(get_db)
+):
+    _require_own_check(db, check_id, user)
+    links = (
+        db.query(ShareLink)
+        .filter(ShareLink.check_id == uuid.UUID(check_id))
+        .order_by(ShareLink.created_at.desc())
+        .all()
+    )
+    return {"shares": [_share_summary(link) for link in links]}
+
+
+@app.delete("/shares/{share_id}")
+def revoke_share_link(
+    share_id: str, user: dict = Depends(auth.require_user), db: Session = Depends(get_db)
+):
+    _parse_uuid(share_id, "share id")
+    link = db.get(ShareLink, uuid.UUID(share_id))
+    if link is None or link.owner != _owner(user):
+        raise HTTPException(status_code=404, detail="Share link not found.")
+    if link.revoked_at is None:
+        link.revoked_at = datetime.utcnow()
+        custody.append_entry(
+            db,
+            subject_type=custody.SUBJECT_EVIDENCE,
+            subject_id=link.check_id,
+            event_type=custody.SHARE_LINK_REVOKED,
+            actor=auth.actor_from(user),
+            payload={"share_id": str(link.id)},
+        )
+        db.commit()
+    return _share_summary(link)
+
+
+def _resolve_share(db: Session, token: str):
+    """The shared check, or 404 / 410. Returns (link, check row)."""
+    link = db.query(ShareLink).filter(ShareLink.token_sha256 == _token_hash(token)).first()
+    if link is None:
+        raise HTTPException(status_code=404, detail="This link does not exist.")
+    if link.revoked_at is not None or link.expires_at <= datetime.utcnow():
+        raise HTTPException(status_code=410, detail="This link has expired or was revoked by its owner.")
+    row = db.execute(
+        text("""
+            SELECT c.id, c.verdict, c.sha256_hash, c.match_method, c.orb_inliers,
+                   c.orb_inlier_ratio, c.created_at, c.owner, c.asset_id,
+                   a.owner AS asset_owner, a.file_name AS asset_name,
+                   a.sha256_hash AS asset_sha256, a.created_at AS asset_registered_at
+            FROM evidence_checks c
+            LEFT JOIN original_assets a ON a.id = c.asset_id
+            WHERE c.id = :id
+        """),
+        {"id": link.check_id},
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="This link does not exist.")
+    return link, row
+
+
+def _original_visible(row) -> bool:
+    """A link shows the original only if the sharer owns it too."""
+    return row.asset_id is not None and row.asset_owner == row.owner
+
+
+@app.get("/shared/{token}")
+def view_shared_check(token: str, db: Session = Depends(get_db)):
+    """What a share link shows. Public: the link is the permission."""
+    link, row = _resolve_share(db, token)
+    link.view_count += 1
+    link.last_viewed_at = datetime.utcnow()
+    db.commit()
+
+    visible = _original_visible(row)
+    entries = custody.list_entries(db, custody.SUBJECT_EVIDENCE, row.id)
+    chain = custody.verify_chain(entries)
+    return {
+        "verification_status": row.verdict,
+        "checked_at": row.created_at.isoformat() if row.created_at else None,
+        "sha256_hash": row.sha256_hash,
+        "match_method": row.match_method,
+        "orb_inliers": row.orb_inliers,
+        "orb_inlier_ratio": float(row.orb_inlier_ratio) if row.orb_inlier_ratio is not None else None,
+        "matched_original": (
+            {
+                "visible": visible,
+                "file_name": row.asset_name if visible else None,
+                "sha256": row.asset_sha256,
+                "registered_at": (
+                    row.asset_registered_at.isoformat() if row.asset_registered_at else None
+                ),
+            }
+            if row.asset_id
+            else None
+        ),
+        "custody": {
+            "intact": chain.get("intact"),
+            "entries": [
+                {"label": e["label"], "occurred_at": e["occurred_at"]} for e in entries
+            ],
+        },
+        "share": {
+            "created_at": link.created_at.isoformat(),
+            "expires_at": link.expires_at.isoformat(),
+        },
+    }
+
+
+@app.get("/shared/{token}/evidence")
+def shared_evidence_image(token: str, db: Session = Depends(get_db)):
+    _, row = _resolve_share(db, token)
+    data, saved_filename = _load_verified_evidence(str(row.id), db, None, check_access=False)
+    media_type = mimetypes.guess_type(saved_filename)[0] or "application/octet-stream"
+    return Response(content=data, media_type=media_type, headers={"X-Content-Type-Options": "nosniff"})
+
+
+@app.get("/shared/{token}/original")
+def shared_original_image(token: str, db: Session = Depends(get_db)):
+    _, row = _resolve_share(db, token)
+    if not _original_visible(row):
+        raise HTTPException(status_code=404, detail="The original is not part of this link.")
+    asset = db.get(OriginalAsset, row.asset_id)
+    return StreamingResponse(io.BytesIO(asset.file_data), media_type="image/jpeg")
+
+
+@app.get("/shared/{token}/altered-regions")
+def shared_altered_regions(token: str, db: Session = Depends(get_db)):
+    _, row = _resolve_share(db, token)
+    if row.asset_id is None:
+        raise HTTPException(status_code=404, detail="This check has no matched original.")
+    payload, _ = _build_difference_artifacts(
+        str(row.id), str(row.asset_id), db, None, check_access=False
+    )
+    return payload
+
+
+@app.get("/shared/{token}/difference-overlay")
+def shared_difference_overlay(token: str, db: Session = Depends(get_db)):
+    _, row = _resolve_share(db, token)
+    if row.asset_id is None:
+        raise HTTPException(status_code=404, detail="This check has no matched original.")
+    _, overlay_path = _build_difference_artifacts(
+        str(row.id), str(row.asset_id), db, None, check_access=False
+    )
+    if overlay_path is None:
+        raise HTTPException(status_code=404, detail="No difference overlay for this check.")
+    return FileResponse(overlay_path, media_type="image/png")
+
+
+# ---------------------------------------------------------------------------
+# Browser extension tokens
+# ---------------------------------------------------------------------------
+# The extension signs in with the same account as the web app: a signed-in
+# user opens the web app's "Connect extension" page, which asks for a token
+# here and hands it to the extension. Web-app tokens last 15 minutes; these
+# last EXTENSION_TOKEN_DAYS, but auth.py lets them call only the routes in
+# auth.EXTENSION_ALLOWED_PATHS (register an original, ask who you are). Only a
+# SHA-256 is stored, and the user can revoke them from the same page.
+
+EXTENSION_TOKEN_DAYS = 90
+
+
+class ExtensionTokenRequest(BaseModel):
+    label: str | None = None
+
+
+def _resolve_extension_token(token: str) -> dict | None:
+    """auth.py's lookup for an extension token: claims, or None if invalid."""
+    db = SessionLocal()
+    try:
+        row = (
+            db.query(ExtensionToken)
+            .filter(ExtensionToken.token_sha256 == _token_hash(token))
+            .first()
+        )
+        if row is None or row.revoked_at is not None or row.expires_at <= datetime.utcnow():
+            return None
+        row.last_used_at = datetime.utcnow()
+        db.commit()
+        # Owners are stored as auth.actor_from() spells them: "user:<id>".
+        return {"sub": row.owner.removeprefix("user:"), "token_type": "extension"}
+    finally:
+        db.close()
+
+
+auth.set_extension_resolver(_resolve_extension_token)
+
+
+def _extension_token_summary(row: ExtensionToken) -> dict:
+    def iso(value):
+        return value.isoformat() if value else None
+
+    return {
+        "id": str(row.id),
+        "label": row.label,
+        "created_at": iso(row.created_at),
+        "expires_at": iso(row.expires_at),
+        "last_used_at": iso(row.last_used_at),
+        "active": row.revoked_at is None and row.expires_at > datetime.utcnow(),
+    }
+
+
+@app.post("/extension-tokens", status_code=status.HTTP_201_CREATED)
+def create_extension_token(
+    request: ExtensionTokenRequest,
+    user: dict = Depends(auth.require_user),
+    db: Session = Depends(get_db),
+):
+    """Issue a token for the extension. Returned once; only its hash is kept.
+
+    An extension token cannot reach this route (auth.py refuses it), so a
+    token can never be used to mint more tokens.
+    """
+    token = auth.EXTENSION_TOKEN_PREFIX + secrets.token_urlsafe(32)
+    row = ExtensionToken(
+        owner=_owner(user),
+        token_sha256=_token_hash(token),
+        label=(request.label or "Browser extension").strip()[:80],
+        expires_at=datetime.utcnow() + timedelta(days=EXTENSION_TOKEN_DAYS),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {**_extension_token_summary(row), "token": token}
+
+
+@app.get("/extension-tokens")
+def list_extension_tokens(user: dict = Depends(auth.require_user), db: Session = Depends(get_db)):
+    rows = (
+        db.query(ExtensionToken)
+        .filter(ExtensionToken.owner == _owner(user))
+        .order_by(ExtensionToken.created_at.desc())
+        .all()
+    )
+    return {"tokens": [_extension_token_summary(row) for row in rows]}
+
+
+@app.delete("/extension-tokens/{token_id}")
+def revoke_extension_token(
+    token_id: str, user: dict = Depends(auth.require_user), db: Session = Depends(get_db)
+):
+    _parse_uuid(token_id, "token id")
+    row = db.get(ExtensionToken, uuid.UUID(token_id))
+    if row is None or row.owner != _owner(user):
+        raise HTTPException(status_code=404, detail="Token not found.")
+    if row.revoked_at is None:
+        row.revoked_at = datetime.utcnow()
+        db.commit()
+    return _extension_token_summary(row)
+
+
+# ---------------------------------------------------------------------------
+# Owner controls: public originals, activity
+# ---------------------------------------------------------------------------
+
+class AssetSettings(BaseModel):
+    public_original: bool
+
+
+@app.patch("/assets/{asset_id}")
+def update_asset(
+    asset_id: str,
+    settings: AssetSettings,
+    user: dict = Depends(auth.require_user),
+    db: Session = Depends(get_db),
+):
+    """Let an owner show their original in other people's checks, or stop.
+
+    Useful when a fake of your screenshot is spreading: anyone who checks the
+    fake then sees your real one beside it. The change is a custody event.
+    """
+    _require_asset_owner(db, asset_id, user)
+    asset = db.get(OriginalAsset, uuid.UUID(asset_id))
+    if asset.public_original != settings.public_original:
+        asset.public_original = settings.public_original
+        custody.append_entry(
+            db,
+            subject_type=custody.SUBJECT_ASSET,
+            subject_id=asset.id,
+            event_type=custody.ORIGINAL_VISIBILITY_CHANGED,
+            actor=auth.actor_from(user),
+            payload={"public": settings.public_original},
+        )
+        db.commit()
+    return {"id": asset_id, "public_original": asset.public_original}
+
+
+ACTIVITY_EVENTS = {
+    custody.SIMILAR_REGISTERED: "Another account registered a similar image",
+    custody.SHOWN_IN_SIMILARITY_WARNING: "A preview was shown to someone registering a similar image",
+}
+
+
+@app.get("/activity")
+def owner_activity(user: dict = Depends(auth.require_user), db: Session = Depends(get_db)):
+    """What other people did with the caller's originals, newest first (E3).
+
+    Checks by other people that matched one of your originals, and the
+    similarity events written to your originals' custody logs. Never says who:
+    other people's identities stay private, as yours do to them.
+    """
+    owner = _owner(user)
+    checks = db.execute(
+        text("""
+            SELECT a.id AS asset_id, a.file_name, c.verdict, c.created_at
+            FROM evidence_checks c
+            JOIN original_assets a ON a.id = c.asset_id
+            WHERE a.owner = :owner AND c.owner IS DISTINCT FROM :owner
+            ORDER BY c.created_at DESC
+            LIMIT 20
+        """),
+        {"owner": owner},
+    ).fetchall()
+    events = db.execute(
+        text("""
+            SELECT a.id AS asset_id, a.file_name, e.event_type, e.occurred_at
+            FROM custody_entries e
+            JOIN original_assets a ON a.id = e.subject_id
+            WHERE e.subject_type = 'asset' AND a.owner = :owner
+              AND e.event_type = ANY(:types)
+            ORDER BY e.occurred_at DESC
+            LIMIT 20
+        """),
+        {"owner": owner, "types": list(ACTIVITY_EVENTS)},
+    ).fetchall()
+
+    items = [
+        {
+            "kind": "check",
+            "asset_id": str(r.asset_id),
+            "original_name": r.file_name,
+            "verdict": r.verdict,
+            "message": "Someone checked a copy of this original",
+            "at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in checks
+    ] + [
+        {
+            "kind": "similar",
+            "asset_id": str(r.asset_id),
+            "original_name": r.file_name,
+            "message": ACTIVITY_EVENTS[r.event_type],
+            "at": r.occurred_at.isoformat() if r.occurred_at else None,
+        }
+        for r in events
+    ]
+    items.sort(key=lambda item: item["at"] or "", reverse=True)
+    return {"activity": items[:20]}

@@ -31,11 +31,18 @@ BEGIN
 END $$;
 
 CREATE INDEX IF NOT EXISTS ix_original_assets_owner ON original_assets (owner);
+CREATE INDEX IF NOT EXISTS ix_evidence_checks_owner ON evidence_checks (owner);
 
 -- The earlier, similar original this one was registered after (see models.py).
 ALTER TABLE original_assets
     ADD COLUMN IF NOT EXISTS similar_to UUID REFERENCES original_assets (id);
-CREATE INDEX IF NOT EXISTS ix_evidence_checks_owner ON evidence_checks (owner);
+
+-- Registration context, labelled by source (see metadata.py).
+ALTER TABLE original_assets ADD COLUMN IF NOT EXISTS registration_metadata JSONB;
+
+-- Owner's opt-in to show the original in other people's checks (see models.py).
+ALTER TABLE original_assets
+    ADD COLUMN IF NOT EXISTS public_original BOOLEAN NOT NULL DEFAULT false;
 
 -- ---------------------------------------------------------------------------
 -- custody_entries is append-only.
