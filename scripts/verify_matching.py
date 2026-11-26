@@ -4,9 +4,13 @@ Runs the real FastAPI app against the live Neon registry and asserts the
 verdict ladder:
 
     exact re-upload      -> VERIFIED_AUTHENTIC   (checked before perceptual work)
-    re-encoded original  -> TAMPERED_MANIPULATED (same picture, different bytes)
-    re-registration      -> refused, idempotent  (duplicate, no new row)
+    re-encoded original  -> RESAVED_COPY         (same picture, different bytes)
+    anonymous register   -> refused, HTTP 401    (registering needs an account)
     unrelated image      -> UNREGISTERED_ASSET
+
+Note: every check below is stored in the LIVE registry with a custody entry,
+which can never be deleted. For a measured evaluation that leaves the live
+data alone, use scripts/evaluate_accuracy.py instead.
 
 Usage (from the backend/ directory):
     python scripts/verify_matching.py
@@ -79,7 +83,7 @@ def main():
     img.save(buf, format="JPEG", quality=72)
     reencoded = buf.getvalue()
     got = upload_evidence("reencoded.jpg", reencoded)["verification_status"]
-    results.append(("re-encoded original", "TAMPERED_MANIPULATED", got))
+    results.append(("re-encoded original", "RESAVED_COPY", got))
 
     # --- 2b. Changed framing. pHash alone rejected these (12-14 bits, past the
     #        old threshold of 10); ORB should still recognise the picture. ---
@@ -99,10 +103,9 @@ def main():
     got = upload_evidence("with-bar.jpg", buf.getvalue())["verification_status"]
     results.append(("+ 8% platform UI bar", "TAMPERED_MANIPULATED", got))
 
-    # --- 3. Re-registration of identical bytes: refused, idempotent --------
-    status, body = register(file_name, file_data)
-    got = f"HTTP {status} duplicate={body.get('duplicate')}"
-    results.append(("re-register same bytes", "HTTP 200 duplicate=True", got))
+    # --- 3. Registering without signing in: refused --------------------
+    status, _ = register(file_name, file_data)
+    results.append(("anonymous register", "HTTP 401", f"HTTP {status}"))
 
     # --- 4. Unrelated image: no candidate within threshold -----------------
     noise = Image.frombytes("RGB", (256, 256), os.urandom(256 * 256 * 3))

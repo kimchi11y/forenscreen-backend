@@ -248,28 +248,38 @@ async def _similar_originals(
         },
     ).fetchall()
 
-    payload = []
-    for candidate in candidates:
-        blob = db.execute(
-            text("SELECT file_data FROM original_assets WHERE id = :id"),
-            {"id": candidate.id},
-        ).fetchone()
-        if blob is None or blob.file_data is None:
-            continue
-        payload.append({
-            "id": candidate.id,
-            "file_name": candidate.file_name,
-            "sha256_hash": candidate.sha256_hash,
-            "phash_distance": int(candidate.distance),
-            "file_data": bytes(blob.file_data),
-        })
-    if not payload:
+    payload = _candidate_payload(db, candidates)
+    ranked = (
+        await run_in_threadpool(matching.rank_candidates, image_bytes, payload)
+        if payload
+        else []
+    )
+    winners = [r for r in ranked if r["ok"]]
+
+    # Same wider pass as a check (see PHASH_WIDE_LIMIT): a cropped copy of
+    # someone else's screenshot must not slip past this warning either.
+    if not winners:
+        wider = _wider_candidates(
+            db, query_phash, [c.id for c in candidates],
+            "AND owner <> :owner AND similar_to IS NULL", {"owner": owner},
+        )
+        wide_payload = _candidate_payload(db, wider)
+        wide_ranked = (
+            await run_in_threadpool(matching.rank_candidates, image_bytes, wide_payload)
+            if wide_payload
+            else []
+        )
+        candidates = list(candidates) + list(wider)
+        payload += wide_payload
+        winners = sorted(
+            (r for r in wide_ranked if r["ok"]),
+            key=lambda r: (-r["inliers"], -r["inlier_ratio"]),
+        )
+    if not winners:
         return []
 
-    ranked = await run_in_threadpool(matching.rank_candidates, image_bytes, payload)
     registered = {str(c.id): c.created_at for c in candidates}
     data = {str(p["id"]): p["file_data"] for p in payload}
-    winners = [r for r in ranked if r["ok"]]
     for winner in winners:
         winner["registered_at"] = registered.get(str(winner["original_asset_id"]))
         winner["file_data"] = data.get(str(winner["original_asset_id"]))
@@ -543,6 +553,15 @@ def get_asset_image(
 PHASH_PREFILTER_THRESHOLD = 24
 PHASH_PREFILTER_LIMIT = 5
 
+# A crop moves pHash a long way: measured on real screenshots, removing the
+# bottom 20% moved it 20-34 bits, past the shortlist above, so ORB never saw the
+# original and the crop came back "No match" - although ORB recognised every
+# one of them almost perfectly. So when the shortlist yields no match, ORB also
+# tries the next-nearest originals regardless of distance. Only checks that are
+# still unmatched pay for this. In a registry much larger than this limit, a
+# heavily cropped copy can still be missed.
+PHASH_WIDE_LIMIT = 15
+
 # Still used as the fallback signal when ORB cannot judge a candidate at all
 # (texture-poor image), where a strict distance is the right thing to demand.
 PHASH_MATCH_THRESHOLD = 10
@@ -559,6 +578,48 @@ ORB_UNVERIFIABLE = {
     "homography_failed",
     "undecodable_original",
 }
+
+
+def _candidate_payload(db: Session, candidates) -> list[dict]:
+    """Load the image bytes for shortlisted originals, in the shape ORB takes."""
+    payload = []
+    for candidate in candidates:
+        blob = db.execute(
+            text("SELECT file_data FROM original_assets WHERE id = :id"),
+            {"id": candidate.id},
+        ).fetchone()
+        if blob is None or blob.file_data is None:
+            continue
+        payload.append({
+            "id": candidate.id,
+            "file_name": candidate.file_name,
+            "sha256_hash": candidate.sha256_hash,
+            "phash_distance": int(candidate.distance),
+            "file_data": bytes(blob.file_data),
+        })
+    return payload
+
+
+def _wider_candidates(
+    db: Session, query_phash: str, exclude_ids, extra_where: str = "", params: dict | None = None
+):
+    """The next-nearest originals by pHash, past the shortlist's threshold."""
+    return db.execute(
+        text(f"""
+            SELECT id, file_name, phash, sha256_hash, created_at,
+                   BIT_COUNT(('x' || phash)::bit(64) # ('x' || :query_phash)::bit(64)) AS distance
+            FROM original_assets
+            WHERE NOT (id = ANY(CAST(:exclude AS uuid[]))) {extra_where}
+            ORDER BY distance ASC
+            LIMIT :limit;
+        """),
+        {
+            "query_phash": query_phash,
+            "exclude": [str(i) for i in exclude_ids],
+            "limit": PHASH_WIDE_LIMIT,
+            **(params or {}),
+        },
+    ).fetchall()
 
 
 @app.post("/upload")
@@ -712,21 +773,7 @@ async def upload_evidence(
                 # 3. Load the candidate bytes. Fetched here rather than in the
                 #    search above so we do not pull megabytes of BYTEA for
                 #    candidates that ORB is never going to look at.
-                payload = []
-                for candidate in candidates:
-                    blob = db.execute(
-                        text("SELECT file_data FROM original_assets WHERE id = :id"),
-                        {"id": candidate.id},
-                    ).fetchone()
-                    if blob is None or blob.file_data is None:
-                        continue
-                    payload.append({
-                        "id": candidate.id,
-                        "file_name": candidate.file_name,
-                        "sha256_hash": candidate.sha256_hash,
-                        "phash_distance": int(candidate.distance),
-                        "file_data": bytes(blob.file_data),
-                    })
+                payload = _candidate_payload(db, candidates)
 
                 # 4. ORB + RANSAC decides. CPU-bound, so it goes to a worker
                 #    thread instead of blocking the event loop.
@@ -739,6 +786,28 @@ async def upload_evidence(
                 )
 
                 winners = [r for r in ranked if r["ok"]]
+
+                # 4b. Nothing on the shortlist: a crop may simply have moved
+                #     pHash past it. Try the next-nearest originals too; their
+                #     results are only kept if one of them really matches.
+                if not winners and not original_asset_id:
+                    wide_payload = _candidate_payload(
+                        db, _wider_candidates(db, computed_phash, [c.id for c in candidates])
+                    )
+                    wide_ranked = (
+                        await run_in_threadpool(
+                            matching.rank_candidates, file_content, wide_payload
+                        )
+                        if wide_payload
+                        else []
+                    )
+                    if any(r["ok"] for r in wide_ranked):
+                        payload += wide_payload
+                        ranked = sorted(
+                            ranked + wide_ranked,
+                            key=lambda r: (-r["inliers"], -r["inlier_ratio"]),
+                        )
+                        winners = [r for r in ranked if r["ok"]]
 
                 if (
                     len(winners) >= 2
