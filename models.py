@@ -132,3 +132,24 @@ class CaseItem(Base):
     subject_type = Column(String(16), primary_key=True)  # 'asset' | 'evidence'
     subject_id = Column(UUID(as_uuid=True), primary_key=True)
     added_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class ShareLink(Base):
+    """A link the owner of a check gives to someone (police, a school) so they
+    can see the result side by side with the original, without an account.
+
+    Only a SHA-256 of the link's secret is stored, so the database never holds
+    a working link. Links expire, and the owner can revoke them at any time.
+    """
+
+    __tablename__ = "share_links"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    check_id = Column(UUID(as_uuid=True), ForeignKey("evidence_checks.id"), nullable=False, index=True)
+    owner = Column(String(128), nullable=False)
+    token_sha256 = Column(String(64), nullable=False, unique=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    revoked_at = Column(DateTime, nullable=True)
+    view_count = Column(Integer, nullable=False, default=0)
+    last_viewed_at = Column(DateTime, nullable=True)

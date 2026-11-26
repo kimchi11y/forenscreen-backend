@@ -2,7 +2,7 @@ from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import uuid
 from PIL import Image
 from PIL import UnidentifiedImageError
@@ -11,6 +11,7 @@ import io
 import imagehash
 from pillow_heif import register_heif_opener
 import mimetypes
+import secrets
 import os
 from pathlib import Path
 import json
@@ -124,7 +125,7 @@ import matching
 import metadata
 import report_pdf
 from database import SessionLocal, ensure_schema, get_db
-from models import Case, CaseItem, CustodyEntry, EvidenceCheck, OriginalAsset
+from models import Case, CaseItem, CustodyEntry, EvidenceCheck, OriginalAsset, ShareLink
 from pydantic import BaseModel
 
 # Pillow does not decode HEIC/HEIF files unless this plugin is registered.
@@ -1168,7 +1169,7 @@ def list_assets(
 # (evidence, original), so the second and later requests are free.
 
 def _load_verified_evidence(
-    file_id: str, db: Session, user: dict | None
+    file_id: str, db: Session, user: dict | None, check_access: bool = True
 ) -> tuple[bytes, str]:
     """Return (bytes, saved_filename) for a stored evidence copy, verified.
 
@@ -1180,8 +1181,14 @@ def _load_verified_evidence(
 
     The id arrives from the client, so it is validated as a UUID first - that
     removes any possibility of a crafted value escaping the uploads directory.
+
+    `check_access=False` is only for a share link, which is itself the
+    permission and has already been validated.
     """
-    _require_check_access(db, file_id, user)
+    if check_access:
+        _require_check_access(db, file_id, user)
+    else:
+        _parse_uuid(file_id, "evidence id")
 
     row = db.execute(
         text("SELECT sha256_hash, saved_filename FROM evidence_checks WHERE id = :id"),
@@ -1224,7 +1231,8 @@ def get_evidence_image(
 
 
 def _build_difference_artifacts(
-    file_id: str, original_asset_id: str, db: Session, user: dict | None
+    file_id: str, original_asset_id: str, db: Session, user: dict | None,
+    check_access: bool = True,
 ):
     """Return (payload, overlay_path|None) for one evidence/original pair."""
     try:
@@ -1234,7 +1242,7 @@ def _build_difference_artifacts(
 
     # Verified before the cache is consulted: the overlay is a picture of the
     # evidence, so it must not be shown once the evidence itself fails.
-    evidence_bytes, _ = _load_verified_evidence(file_id, db, user)
+    evidence_bytes, _ = _load_verified_evidence(file_id, db, user, check_access)
 
     regions_path = UPLOAD_DIR / f"{file_id}__{original_asset_id}__regions.json"
     overlay_path = UPLOAD_DIR / f"{file_id}__{original_asset_id}__overlay.png"
@@ -2048,3 +2056,238 @@ def remove_case_item(
     )
     db.commit()
     return {"removed": True}
+
+
+# ---------------------------------------------------------------------------
+# Share links
+# ---------------------------------------------------------------------------
+# The owner of a check can give a link to someone without an account - the
+# police, a school - to see the result side by side with the original. It is
+# the safe way to show an original: the owner chooses who sees it.
+#
+# A link shows the original only when the check's owner also owns the matched
+# original. Sharing your check of someone else's screenshot never reveals their
+# picture. Only a SHA-256 of each link's secret is stored, links expire, and the
+# owner can revoke them. Creating and revoking are custody events; views are
+# counted on the link itself rather than logged, so a busy link cannot flood
+# the check's custody log.
+
+SHARE_DEFAULT_DAYS = 30
+SHARE_MAX_DAYS = 90
+
+
+class ShareRequest(BaseModel):
+    days: int = SHARE_DEFAULT_DAYS
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _share_summary(link: ShareLink) -> dict:
+    def iso(value):
+        return value.isoformat() if value else None
+
+    now = datetime.utcnow()
+    return {
+        "id": str(link.id),
+        "created_at": iso(link.created_at),
+        "expires_at": iso(link.expires_at),
+        "revoked_at": iso(link.revoked_at),
+        "active": link.revoked_at is None and link.expires_at > now,
+        "view_count": link.view_count,
+        "last_viewed_at": iso(link.last_viewed_at),
+    }
+
+
+def _require_own_check(db: Session, check_id: str, user: dict) -> None:
+    """Only a signed-in owner may share a check; anonymous checks have none."""
+    _parse_uuid(check_id, "check id")
+    owner = db.execute(
+        text("SELECT owner FROM evidence_checks WHERE id = :id"), {"id": check_id}
+    ).scalar()
+    if owner is None or owner != _owner(user):
+        raise HTTPException(status_code=404, detail="Check not found.")
+
+
+@app.post("/checks/{check_id}/share", status_code=status.HTTP_201_CREATED)
+def create_share_link(
+    check_id: str,
+    request: ShareRequest,
+    user: dict = Depends(auth.require_user),
+    db: Session = Depends(get_db),
+):
+    """Create a link. The secret is returned here once and never again."""
+    _require_own_check(db, check_id, user)
+    if not 1 <= request.days <= SHARE_MAX_DAYS:
+        raise HTTPException(status_code=400, detail=f"A link can last 1-{SHARE_MAX_DAYS} days.")
+
+    token = secrets.token_urlsafe(32)
+    link = ShareLink(
+        check_id=uuid.UUID(check_id),
+        owner=_owner(user),
+        token_sha256=_token_hash(token),
+        expires_at=datetime.utcnow() + timedelta(days=request.days),
+    )
+    db.add(link)
+    db.flush()
+    custody.append_entry(
+        db,
+        subject_type=custody.SUBJECT_EVIDENCE,
+        subject_id=uuid.UUID(check_id),
+        event_type=custody.SHARE_LINK_CREATED,
+        actor=auth.actor_from(user),
+        payload={"share_id": str(link.id), "expires_at": link.expires_at.isoformat()},
+    )
+    db.commit()
+    db.refresh(link)
+    return {**_share_summary(link), "token": token}
+
+
+@app.get("/checks/{check_id}/shares")
+def list_share_links(
+    check_id: str, user: dict = Depends(auth.require_user), db: Session = Depends(get_db)
+):
+    _require_own_check(db, check_id, user)
+    links = (
+        db.query(ShareLink)
+        .filter(ShareLink.check_id == uuid.UUID(check_id))
+        .order_by(ShareLink.created_at.desc())
+        .all()
+    )
+    return {"shares": [_share_summary(link) for link in links]}
+
+
+@app.delete("/shares/{share_id}")
+def revoke_share_link(
+    share_id: str, user: dict = Depends(auth.require_user), db: Session = Depends(get_db)
+):
+    _parse_uuid(share_id, "share id")
+    link = db.get(ShareLink, uuid.UUID(share_id))
+    if link is None or link.owner != _owner(user):
+        raise HTTPException(status_code=404, detail="Share link not found.")
+    if link.revoked_at is None:
+        link.revoked_at = datetime.utcnow()
+        custody.append_entry(
+            db,
+            subject_type=custody.SUBJECT_EVIDENCE,
+            subject_id=link.check_id,
+            event_type=custody.SHARE_LINK_REVOKED,
+            actor=auth.actor_from(user),
+            payload={"share_id": str(link.id)},
+        )
+        db.commit()
+    return _share_summary(link)
+
+
+def _resolve_share(db: Session, token: str):
+    """The shared check, or 404 / 410. Returns (link, check row)."""
+    link = db.query(ShareLink).filter(ShareLink.token_sha256 == _token_hash(token)).first()
+    if link is None:
+        raise HTTPException(status_code=404, detail="This link does not exist.")
+    if link.revoked_at is not None or link.expires_at <= datetime.utcnow():
+        raise HTTPException(status_code=410, detail="This link has expired or was revoked by its owner.")
+    row = db.execute(
+        text("""
+            SELECT c.id, c.verdict, c.sha256_hash, c.match_method, c.orb_inliers,
+                   c.orb_inlier_ratio, c.created_at, c.owner, c.asset_id,
+                   a.owner AS asset_owner, a.file_name AS asset_name,
+                   a.sha256_hash AS asset_sha256, a.created_at AS asset_registered_at
+            FROM evidence_checks c
+            LEFT JOIN original_assets a ON a.id = c.asset_id
+            WHERE c.id = :id
+        """),
+        {"id": link.check_id},
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="This link does not exist.")
+    return link, row
+
+
+def _original_visible(row) -> bool:
+    """A link shows the original only if the sharer owns it too."""
+    return row.asset_id is not None and row.asset_owner == row.owner
+
+
+@app.get("/shared/{token}")
+def view_shared_check(token: str, db: Session = Depends(get_db)):
+    """What a share link shows. Public: the link is the permission."""
+    link, row = _resolve_share(db, token)
+    link.view_count += 1
+    link.last_viewed_at = datetime.utcnow()
+    db.commit()
+
+    visible = _original_visible(row)
+    entries = custody.list_entries(db, custody.SUBJECT_EVIDENCE, row.id)
+    chain = custody.verify_chain(entries)
+    return {
+        "verification_status": row.verdict,
+        "checked_at": row.created_at.isoformat() if row.created_at else None,
+        "sha256_hash": row.sha256_hash,
+        "match_method": row.match_method,
+        "orb_inliers": row.orb_inliers,
+        "orb_inlier_ratio": float(row.orb_inlier_ratio) if row.orb_inlier_ratio is not None else None,
+        "matched_original": (
+            {
+                "visible": visible,
+                "file_name": row.asset_name if visible else None,
+                "sha256": row.asset_sha256,
+                "registered_at": (
+                    row.asset_registered_at.isoformat() if row.asset_registered_at else None
+                ),
+            }
+            if row.asset_id
+            else None
+        ),
+        "custody": {
+            "intact": chain.get("intact"),
+            "entries": [
+                {"label": e["label"], "occurred_at": e["occurred_at"]} for e in entries
+            ],
+        },
+        "share": {
+            "created_at": link.created_at.isoformat(),
+            "expires_at": link.expires_at.isoformat(),
+        },
+    }
+
+
+@app.get("/shared/{token}/evidence")
+def shared_evidence_image(token: str, db: Session = Depends(get_db)):
+    _, row = _resolve_share(db, token)
+    data, saved_filename = _load_verified_evidence(str(row.id), db, None, check_access=False)
+    media_type = mimetypes.guess_type(saved_filename)[0] or "application/octet-stream"
+    return Response(content=data, media_type=media_type, headers={"X-Content-Type-Options": "nosniff"})
+
+
+@app.get("/shared/{token}/original")
+def shared_original_image(token: str, db: Session = Depends(get_db)):
+    _, row = _resolve_share(db, token)
+    if not _original_visible(row):
+        raise HTTPException(status_code=404, detail="The original is not part of this link.")
+    asset = db.get(OriginalAsset, row.asset_id)
+    return StreamingResponse(io.BytesIO(asset.file_data), media_type="image/jpeg")
+
+
+@app.get("/shared/{token}/altered-regions")
+def shared_altered_regions(token: str, db: Session = Depends(get_db)):
+    _, row = _resolve_share(db, token)
+    if row.asset_id is None:
+        raise HTTPException(status_code=404, detail="This check has no matched original.")
+    payload, _ = _build_difference_artifacts(
+        str(row.id), str(row.asset_id), db, None, check_access=False
+    )
+    return payload
+
+
+@app.get("/shared/{token}/difference-overlay")
+def shared_difference_overlay(token: str, db: Session = Depends(get_db)):
+    _, row = _resolve_share(db, token)
+    if row.asset_id is None:
+        raise HTTPException(status_code=404, detail="This check has no matched original.")
+    _, overlay_path = _build_difference_artifacts(
+        str(row.id), str(row.asset_id), db, None, check_access=False
+    )
+    if overlay_path is None:
+        raise HTTPException(status_code=404, detail="No difference overlay for this check.")
+    return FileResponse(overlay_path, media_type="image/png")
