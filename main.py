@@ -2,7 +2,7 @@ from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import uuid
 from PIL import Image
 from PIL import UnidentifiedImageError
@@ -11,6 +11,7 @@ import io
 import imagehash
 from pillow_heif import register_heif_opener
 import mimetypes
+import secrets
 import os
 from pathlib import Path
 import json
@@ -124,7 +125,9 @@ import matching
 import metadata
 import report_pdf
 from database import SessionLocal, ensure_schema, get_db
-from models import Case, CaseItem, CustodyEntry, EvidenceCheck, OriginalAsset
+from models import (
+    Case, CaseItem, CustodyEntry, EvidenceCheck, ExtensionToken, OriginalAsset, ShareLink,
+)
 from pydantic import BaseModel
 
 # Pillow does not decode HEIC/HEIF files unless this plugin is registered.
@@ -199,7 +202,7 @@ def _describe_matches(db: Session, matched: dict | None, user: dict | None):
 
     rows = db.execute(
         text("""
-            SELECT id, owner, created_at FROM original_assets
+            SELECT id, owner, created_at, public_original FROM original_assets
             WHERE id = ANY(CAST(:ids AS uuid[]))
         """),
         {"ids": ids},
@@ -211,6 +214,9 @@ def _describe_matches(db: Session, matched: dict | None, user: dict | None):
         row = by_id.get(str(entry.get("original_asset_id")))
         is_owner = row is not None and me is not None and row.owner == me
         entry["is_owner"] = is_owner
+        # The owner may choose to show the original to everyone (E2). The
+        # filename stays private either way.
+        entry["original_public"] = bool(row is not None and row.public_original)
         entry["registered_at"] = (
             row.created_at.isoformat() if row is not None and row.created_at else None
         )
@@ -539,12 +545,15 @@ def _existing_registration(existing: OriginalAsset, user: dict) -> JSONResponse:
 @app.get("/view-asset/{asset_id}")
 def get_asset_image(
     asset_id: str,
-    user: dict = Depends(auth.require_user),
+    user: dict | None = Depends(auth.optional_user),
     db: Session = Depends(get_db),
 ):
-    """A registered original's image, for its owner only."""
-    _require_asset_owner(db, asset_id, user)
+    """A registered original's image: for its owner, or for anyone if the
+    owner chose to show it in public checks."""
+    _parse_uuid(asset_id, "asset id")
     asset = db.query(OriginalAsset).filter(OriginalAsset.id == asset_id).first()
+    if asset is None or (asset.owner != _owner(user) and not asset.public_original):
+        raise HTTPException(status_code=404, detail="Asset not found.")
 
     # Stream binary data directly back out as a standard displayable JPEG/PNG
     return StreamingResponse(io.BytesIO(asset.file_data), media_type="image/jpeg")
@@ -819,6 +828,24 @@ async def upload_evidence(
                             key=lambda r: (-r["inliers"], -r["inlier_ratio"]),
                         )
                         winners = [r for r in ranked if r["ok"]]
+
+                # 4c. A registration flagged as made after a similar earlier
+                #     original is nobody's baseline while an unflagged original
+                #     also matches: a re-shared copy of a fake should be judged
+                #     against the real original, not against the fake (E4).
+                if len(winners) >= 2:
+                    flagged = {
+                        str(r.id) for r in db.execute(
+                            text("""
+                                SELECT id FROM original_assets
+                                WHERE id = ANY(CAST(:ids AS uuid[])) AND similar_to IS NOT NULL
+                            """),
+                            {"ids": [str(w["original_asset_id"]) for w in winners]},
+                        ).fetchall()
+                    }
+                    unflagged = [w for w in winners if str(w["original_asset_id"]) not in flagged]
+                    if unflagged:
+                        winners = unflagged
 
                 if (
                     len(winners) >= 2
@@ -1125,7 +1152,8 @@ def list_assets(
     owner = _owner(user)
     rows = db.execute(
         text("""
-            SELECT id, file_name, phash, sha256_hash, created_at, registration_metadata
+            SELECT id, file_name, phash, sha256_hash, created_at, registration_metadata,
+                   public_original
             FROM original_assets
             WHERE owner = :owner
             ORDER BY created_at DESC
@@ -1152,6 +1180,7 @@ def list_assets(
                 "created_at": row.created_at.isoformat() if row.created_at else None,
                 "image_url": f"/view-asset/{row.id}",
                 "registration_metadata": row.registration_metadata,
+                "public_original": row.public_original,
             }
             for row in rows
         ],
@@ -1168,7 +1197,7 @@ def list_assets(
 # (evidence, original), so the second and later requests are free.
 
 def _load_verified_evidence(
-    file_id: str, db: Session, user: dict | None
+    file_id: str, db: Session, user: dict | None, check_access: bool = True
 ) -> tuple[bytes, str]:
     """Return (bytes, saved_filename) for a stored evidence copy, verified.
 
@@ -1180,8 +1209,14 @@ def _load_verified_evidence(
 
     The id arrives from the client, so it is validated as a UUID first - that
     removes any possibility of a crafted value escaping the uploads directory.
+
+    `check_access=False` is only for a share link, which is itself the
+    permission and has already been validated.
     """
-    _require_check_access(db, file_id, user)
+    if check_access:
+        _require_check_access(db, file_id, user)
+    else:
+        _parse_uuid(file_id, "evidence id")
 
     row = db.execute(
         text("SELECT sha256_hash, saved_filename FROM evidence_checks WHERE id = :id"),
@@ -1224,7 +1259,8 @@ def get_evidence_image(
 
 
 def _build_difference_artifacts(
-    file_id: str, original_asset_id: str, db: Session, user: dict | None
+    file_id: str, original_asset_id: str, db: Session, user: dict | None,
+    check_access: bool = True,
 ):
     """Return (payload, overlay_path|None) for one evidence/original pair."""
     try:
@@ -1234,7 +1270,7 @@ def _build_difference_artifacts(
 
     # Verified before the cache is consulted: the overlay is a picture of the
     # evidence, so it must not be shown once the evidence itself fails.
-    evidence_bytes, _ = _load_verified_evidence(file_id, db, user)
+    evidence_bytes, _ = _load_verified_evidence(file_id, db, user, check_access)
 
     regions_path = UPLOAD_DIR / f"{file_id}__{original_asset_id}__regions.json"
     overlay_path = UPLOAD_DIR / f"{file_id}__{original_asset_id}__overlay.png"
@@ -1788,7 +1824,8 @@ def get_check(
             SELECT c.id, c.asset_id, c.sha256_hash, c.phash, c.verdict, c.match_method,
                    c.orb_inliers, c.orb_inlier_ratio, c.phash_distance,
                    c.saved_filename, c.created_at,
-                   a.owner AS asset_owner, a.created_at AS asset_registered_at
+                   a.owner AS asset_owner, a.created_at AS asset_registered_at,
+                   a.public_original AS asset_public
             FROM evidence_checks c
             LEFT JOIN original_assets a ON a.id = c.asset_id
             WHERE c.id = :id
@@ -1803,6 +1840,7 @@ def get_check(
         "file_id": str(row.id),
         "asset_id": str(row.asset_id) if row.asset_id else None,
         "asset_is_owner": row.asset_id is not None and row.asset_owner == _owner(user),
+        "asset_public": bool(row.asset_public),
         "asset_registered_at": (
             row.asset_registered_at.isoformat() if row.asset_registered_at else None
         ),
@@ -2048,3 +2086,439 @@ def remove_case_item(
     )
     db.commit()
     return {"removed": True}
+
+
+# ---------------------------------------------------------------------------
+# Share links
+# ---------------------------------------------------------------------------
+# The owner of a check can give a link to someone without an account - the
+# police, a school - to see the result side by side with the original. It is
+# the safe way to show an original: the owner chooses who sees it.
+#
+# A link shows the original only when the check's owner also owns the matched
+# original. Sharing your check of someone else's screenshot never reveals their
+# picture. Only a SHA-256 of each link's secret is stored, links expire, and the
+# owner can revoke them. Creating and revoking are custody events; views are
+# counted on the link itself rather than logged, so a busy link cannot flood
+# the check's custody log.
+
+SHARE_DEFAULT_DAYS = 30
+SHARE_MAX_DAYS = 90
+
+
+class ShareRequest(BaseModel):
+    days: int = SHARE_DEFAULT_DAYS
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _share_summary(link: ShareLink) -> dict:
+    def iso(value):
+        return value.isoformat() if value else None
+
+    now = datetime.utcnow()
+    return {
+        "id": str(link.id),
+        "created_at": iso(link.created_at),
+        "expires_at": iso(link.expires_at),
+        "revoked_at": iso(link.revoked_at),
+        "active": link.revoked_at is None and link.expires_at > now,
+        "view_count": link.view_count,
+        "last_viewed_at": iso(link.last_viewed_at),
+    }
+
+
+def _require_own_check(db: Session, check_id: str, user: dict) -> None:
+    """Only a signed-in owner may share a check; anonymous checks have none."""
+    _parse_uuid(check_id, "check id")
+    owner = db.execute(
+        text("SELECT owner FROM evidence_checks WHERE id = :id"), {"id": check_id}
+    ).scalar()
+    if owner is None or owner != _owner(user):
+        raise HTTPException(status_code=404, detail="Check not found.")
+
+
+@app.post("/checks/{check_id}/share", status_code=status.HTTP_201_CREATED)
+def create_share_link(
+    check_id: str,
+    request: ShareRequest,
+    user: dict = Depends(auth.require_user),
+    db: Session = Depends(get_db),
+):
+    """Create a link. The secret is returned here once and never again."""
+    _require_own_check(db, check_id, user)
+    if not 1 <= request.days <= SHARE_MAX_DAYS:
+        raise HTTPException(status_code=400, detail=f"A link can last 1-{SHARE_MAX_DAYS} days.")
+
+    token = secrets.token_urlsafe(32)
+    link = ShareLink(
+        check_id=uuid.UUID(check_id),
+        owner=_owner(user),
+        token_sha256=_token_hash(token),
+        expires_at=datetime.utcnow() + timedelta(days=request.days),
+    )
+    db.add(link)
+    db.flush()
+    custody.append_entry(
+        db,
+        subject_type=custody.SUBJECT_EVIDENCE,
+        subject_id=uuid.UUID(check_id),
+        event_type=custody.SHARE_LINK_CREATED,
+        actor=auth.actor_from(user),
+        payload={"share_id": str(link.id), "expires_at": link.expires_at.isoformat()},
+    )
+    db.commit()
+    db.refresh(link)
+    return {**_share_summary(link), "token": token}
+
+
+@app.get("/checks/{check_id}/shares")
+def list_share_links(
+    check_id: str, user: dict = Depends(auth.require_user), db: Session = Depends(get_db)
+):
+    _require_own_check(db, check_id, user)
+    links = (
+        db.query(ShareLink)
+        .filter(ShareLink.check_id == uuid.UUID(check_id))
+        .order_by(ShareLink.created_at.desc())
+        .all()
+    )
+    return {"shares": [_share_summary(link) for link in links]}
+
+
+@app.delete("/shares/{share_id}")
+def revoke_share_link(
+    share_id: str, user: dict = Depends(auth.require_user), db: Session = Depends(get_db)
+):
+    _parse_uuid(share_id, "share id")
+    link = db.get(ShareLink, uuid.UUID(share_id))
+    if link is None or link.owner != _owner(user):
+        raise HTTPException(status_code=404, detail="Share link not found.")
+    if link.revoked_at is None:
+        link.revoked_at = datetime.utcnow()
+        custody.append_entry(
+            db,
+            subject_type=custody.SUBJECT_EVIDENCE,
+            subject_id=link.check_id,
+            event_type=custody.SHARE_LINK_REVOKED,
+            actor=auth.actor_from(user),
+            payload={"share_id": str(link.id)},
+        )
+        db.commit()
+    return _share_summary(link)
+
+
+def _resolve_share(db: Session, token: str):
+    """The shared check, or 404 / 410. Returns (link, check row)."""
+    link = db.query(ShareLink).filter(ShareLink.token_sha256 == _token_hash(token)).first()
+    if link is None:
+        raise HTTPException(status_code=404, detail="This link does not exist.")
+    if link.revoked_at is not None or link.expires_at <= datetime.utcnow():
+        raise HTTPException(status_code=410, detail="This link has expired or was revoked by its owner.")
+    row = db.execute(
+        text("""
+            SELECT c.id, c.verdict, c.sha256_hash, c.match_method, c.orb_inliers,
+                   c.orb_inlier_ratio, c.created_at, c.owner, c.asset_id,
+                   a.owner AS asset_owner, a.file_name AS asset_name,
+                   a.sha256_hash AS asset_sha256, a.created_at AS asset_registered_at
+            FROM evidence_checks c
+            LEFT JOIN original_assets a ON a.id = c.asset_id
+            WHERE c.id = :id
+        """),
+        {"id": link.check_id},
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="This link does not exist.")
+    return link, row
+
+
+def _original_visible(row) -> bool:
+    """A link shows the original only if the sharer owns it too."""
+    return row.asset_id is not None and row.asset_owner == row.owner
+
+
+@app.get("/shared/{token}")
+def view_shared_check(token: str, db: Session = Depends(get_db)):
+    """What a share link shows. Public: the link is the permission."""
+    link, row = _resolve_share(db, token)
+    link.view_count += 1
+    link.last_viewed_at = datetime.utcnow()
+    db.commit()
+
+    visible = _original_visible(row)
+    entries = custody.list_entries(db, custody.SUBJECT_EVIDENCE, row.id)
+    chain = custody.verify_chain(entries)
+    return {
+        "verification_status": row.verdict,
+        "checked_at": row.created_at.isoformat() if row.created_at else None,
+        "sha256_hash": row.sha256_hash,
+        "match_method": row.match_method,
+        "orb_inliers": row.orb_inliers,
+        "orb_inlier_ratio": float(row.orb_inlier_ratio) if row.orb_inlier_ratio is not None else None,
+        "matched_original": (
+            {
+                "visible": visible,
+                "file_name": row.asset_name if visible else None,
+                "sha256": row.asset_sha256,
+                "registered_at": (
+                    row.asset_registered_at.isoformat() if row.asset_registered_at else None
+                ),
+            }
+            if row.asset_id
+            else None
+        ),
+        "custody": {
+            "intact": chain.get("intact"),
+            "entries": [
+                {"label": e["label"], "occurred_at": e["occurred_at"]} for e in entries
+            ],
+        },
+        "share": {
+            "created_at": link.created_at.isoformat(),
+            "expires_at": link.expires_at.isoformat(),
+        },
+    }
+
+
+@app.get("/shared/{token}/evidence")
+def shared_evidence_image(token: str, db: Session = Depends(get_db)):
+    _, row = _resolve_share(db, token)
+    data, saved_filename = _load_verified_evidence(str(row.id), db, None, check_access=False)
+    media_type = mimetypes.guess_type(saved_filename)[0] or "application/octet-stream"
+    return Response(content=data, media_type=media_type, headers={"X-Content-Type-Options": "nosniff"})
+
+
+@app.get("/shared/{token}/original")
+def shared_original_image(token: str, db: Session = Depends(get_db)):
+    _, row = _resolve_share(db, token)
+    if not _original_visible(row):
+        raise HTTPException(status_code=404, detail="The original is not part of this link.")
+    asset = db.get(OriginalAsset, row.asset_id)
+    return StreamingResponse(io.BytesIO(asset.file_data), media_type="image/jpeg")
+
+
+@app.get("/shared/{token}/altered-regions")
+def shared_altered_regions(token: str, db: Session = Depends(get_db)):
+    _, row = _resolve_share(db, token)
+    if row.asset_id is None:
+        raise HTTPException(status_code=404, detail="This check has no matched original.")
+    payload, _ = _build_difference_artifacts(
+        str(row.id), str(row.asset_id), db, None, check_access=False
+    )
+    return payload
+
+
+@app.get("/shared/{token}/difference-overlay")
+def shared_difference_overlay(token: str, db: Session = Depends(get_db)):
+    _, row = _resolve_share(db, token)
+    if row.asset_id is None:
+        raise HTTPException(status_code=404, detail="This check has no matched original.")
+    _, overlay_path = _build_difference_artifacts(
+        str(row.id), str(row.asset_id), db, None, check_access=False
+    )
+    if overlay_path is None:
+        raise HTTPException(status_code=404, detail="No difference overlay for this check.")
+    return FileResponse(overlay_path, media_type="image/png")
+
+
+# ---------------------------------------------------------------------------
+# Browser extension tokens
+# ---------------------------------------------------------------------------
+# The extension signs in with the same account as the web app: a signed-in
+# user opens the web app's "Connect extension" page, which asks for a token
+# here and hands it to the extension. Web-app tokens last 15 minutes; these
+# last EXTENSION_TOKEN_DAYS, but auth.py lets them call only the routes in
+# auth.EXTENSION_ALLOWED_PATHS (register an original, ask who you are). Only a
+# SHA-256 is stored, and the user can revoke them from the same page.
+
+EXTENSION_TOKEN_DAYS = 90
+
+
+class ExtensionTokenRequest(BaseModel):
+    label: str | None = None
+
+
+def _resolve_extension_token(token: str) -> dict | None:
+    """auth.py's lookup for an extension token: claims, or None if invalid."""
+    db = SessionLocal()
+    try:
+        row = (
+            db.query(ExtensionToken)
+            .filter(ExtensionToken.token_sha256 == _token_hash(token))
+            .first()
+        )
+        if row is None or row.revoked_at is not None or row.expires_at <= datetime.utcnow():
+            return None
+        row.last_used_at = datetime.utcnow()
+        db.commit()
+        # Owners are stored as auth.actor_from() spells them: "user:<id>".
+        return {"sub": row.owner.removeprefix("user:"), "token_type": "extension"}
+    finally:
+        db.close()
+
+
+auth.set_extension_resolver(_resolve_extension_token)
+
+
+def _extension_token_summary(row: ExtensionToken) -> dict:
+    def iso(value):
+        return value.isoformat() if value else None
+
+    return {
+        "id": str(row.id),
+        "label": row.label,
+        "created_at": iso(row.created_at),
+        "expires_at": iso(row.expires_at),
+        "last_used_at": iso(row.last_used_at),
+        "active": row.revoked_at is None and row.expires_at > datetime.utcnow(),
+    }
+
+
+@app.post("/extension-tokens", status_code=status.HTTP_201_CREATED)
+def create_extension_token(
+    request: ExtensionTokenRequest,
+    user: dict = Depends(auth.require_user),
+    db: Session = Depends(get_db),
+):
+    """Issue a token for the extension. Returned once; only its hash is kept.
+
+    An extension token cannot reach this route (auth.py refuses it), so a
+    token can never be used to mint more tokens.
+    """
+    token = auth.EXTENSION_TOKEN_PREFIX + secrets.token_urlsafe(32)
+    row = ExtensionToken(
+        owner=_owner(user),
+        token_sha256=_token_hash(token),
+        label=(request.label or "Browser extension").strip()[:80],
+        expires_at=datetime.utcnow() + timedelta(days=EXTENSION_TOKEN_DAYS),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {**_extension_token_summary(row), "token": token}
+
+
+@app.get("/extension-tokens")
+def list_extension_tokens(user: dict = Depends(auth.require_user), db: Session = Depends(get_db)):
+    rows = (
+        db.query(ExtensionToken)
+        .filter(ExtensionToken.owner == _owner(user))
+        .order_by(ExtensionToken.created_at.desc())
+        .all()
+    )
+    return {"tokens": [_extension_token_summary(row) for row in rows]}
+
+
+@app.delete("/extension-tokens/{token_id}")
+def revoke_extension_token(
+    token_id: str, user: dict = Depends(auth.require_user), db: Session = Depends(get_db)
+):
+    _parse_uuid(token_id, "token id")
+    row = db.get(ExtensionToken, uuid.UUID(token_id))
+    if row is None or row.owner != _owner(user):
+        raise HTTPException(status_code=404, detail="Token not found.")
+    if row.revoked_at is None:
+        row.revoked_at = datetime.utcnow()
+        db.commit()
+    return _extension_token_summary(row)
+
+
+# ---------------------------------------------------------------------------
+# Owner controls: public originals, activity
+# ---------------------------------------------------------------------------
+
+class AssetSettings(BaseModel):
+    public_original: bool
+
+
+@app.patch("/assets/{asset_id}")
+def update_asset(
+    asset_id: str,
+    settings: AssetSettings,
+    user: dict = Depends(auth.require_user),
+    db: Session = Depends(get_db),
+):
+    """Let an owner show their original in other people's checks, or stop.
+
+    Useful when a fake of your screenshot is spreading: anyone who checks the
+    fake then sees your real one beside it. The change is a custody event.
+    """
+    _require_asset_owner(db, asset_id, user)
+    asset = db.get(OriginalAsset, uuid.UUID(asset_id))
+    if asset.public_original != settings.public_original:
+        asset.public_original = settings.public_original
+        custody.append_entry(
+            db,
+            subject_type=custody.SUBJECT_ASSET,
+            subject_id=asset.id,
+            event_type=custody.ORIGINAL_VISIBILITY_CHANGED,
+            actor=auth.actor_from(user),
+            payload={"public": settings.public_original},
+        )
+        db.commit()
+    return {"id": asset_id, "public_original": asset.public_original}
+
+
+ACTIVITY_EVENTS = {
+    custody.SIMILAR_REGISTERED: "Another account registered a similar image",
+    custody.SHOWN_IN_SIMILARITY_WARNING: "A preview was shown to someone registering a similar image",
+}
+
+
+@app.get("/activity")
+def owner_activity(user: dict = Depends(auth.require_user), db: Session = Depends(get_db)):
+    """What other people did with the caller's originals, newest first (E3).
+
+    Checks by other people that matched one of your originals, and the
+    similarity events written to your originals' custody logs. Never says who:
+    other people's identities stay private, as yours do to them.
+    """
+    owner = _owner(user)
+    checks = db.execute(
+        text("""
+            SELECT a.id AS asset_id, a.file_name, c.verdict, c.created_at
+            FROM evidence_checks c
+            JOIN original_assets a ON a.id = c.asset_id
+            WHERE a.owner = :owner AND c.owner IS DISTINCT FROM :owner
+            ORDER BY c.created_at DESC
+            LIMIT 20
+        """),
+        {"owner": owner},
+    ).fetchall()
+    events = db.execute(
+        text("""
+            SELECT a.id AS asset_id, a.file_name, e.event_type, e.occurred_at
+            FROM custody_entries e
+            JOIN original_assets a ON a.id = e.subject_id
+            WHERE e.subject_type = 'asset' AND a.owner = :owner
+              AND e.event_type = ANY(:types)
+            ORDER BY e.occurred_at DESC
+            LIMIT 20
+        """),
+        {"owner": owner, "types": list(ACTIVITY_EVENTS)},
+    ).fetchall()
+
+    items = [
+        {
+            "kind": "check",
+            "asset_id": str(r.asset_id),
+            "original_name": r.file_name,
+            "verdict": r.verdict,
+            "message": "Someone checked a copy of this original",
+            "at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in checks
+    ] + [
+        {
+            "kind": "similar",
+            "asset_id": str(r.asset_id),
+            "original_name": r.file_name,
+            "message": ACTIVITY_EVENTS[r.event_type],
+            "at": r.occurred_at.isoformat() if r.occurred_at else None,
+        }
+        for r in events
+    ]
+    items.sort(key=lambda item: item["at"] or "", reverse=True)
+    return {"activity": items[:20]}
