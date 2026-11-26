@@ -11,6 +11,7 @@ import io
 import imagehash
 from pillow_heif import register_heif_opener
 import mimetypes
+import os
 from pathlib import Path
 import json
 from sqlalchemy import text
@@ -121,6 +122,7 @@ import blockchain
 import custody
 import matching
 import metadata
+import report_pdf
 from database import SessionLocal, ensure_schema, get_db
 from models import Case, CaseItem, CustodyEntry, EvidenceCheck, OriginalAsset
 from pydantic import BaseModel
@@ -1637,19 +1639,8 @@ def verify_anchor(
     }
 
 
-@app.post("/checks/{check_id}/report")
-def export_check_report(
-    check_id: str,
-    user: dict | None = Depends(auth.optional_user),
-    db: Session = Depends(get_db),
-):
-    """Produce a report for one check, and record that it was exported.
-
-    Exporting is itself a custody event: a copy leaving the system is exactly
-    the kind of thing a chain of custody exists to record. The report embeds the
-    custody chain and its verification result, so the document carries its own
-    evidence of completeness instead of asserting it.
-    """
+def _gather_report(db: Session, check_id: str, user: dict | None) -> dict:
+    """The report for one check, without recording anything yet."""
     _require_check_access(db, check_id, user)
 
     row = db.execute(
@@ -1670,8 +1661,44 @@ def export_check_report(
         raise HTTPException(status_code=404, detail="Check not found.")
 
     entries = custody.list_entries(db, custody.SUBJECT_EVIDENCE, check_id)
-    chain = custody.verify_chain(entries)
+    return {
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "generated_by": auth.actor_from(user),
+        "check": {
+            "id": str(row.id),
+            "sha256": row.sha256_hash,
+            "phash": row.phash,
+            "verdict": row.verdict,
+            "match_method": row.match_method,
+            "orb_inliers": row.orb_inliers,
+            "orb_inlier_ratio": (
+                float(row.orb_inlier_ratio) if row.orb_inlier_ratio is not None else None
+            ),
+            "phash_distance": row.phash_distance,
+            "saved_filename": row.saved_filename,
+            "checked_at": row.created_at.isoformat() if row.created_at else None,
+            "matched_asset": (
+                {
+                    "id": str(row.asset_id),
+                    "file_name": row.asset_name,
+                    "sha256": row.asset_sha256,
+                    "registered_at": (
+                        row.asset_registered_at.isoformat()
+                        if row.asset_registered_at
+                        else None
+                    ),
+                }
+                if row.asset_id
+                else None
+            ),
+        },
+        "custody": {"chain": custody.verify_chain(entries), "entries": entries},
+    }
 
+
+def _record_export(db: Session, check_id: str, user: dict | None, report: dict, fmt: str) -> None:
+    """Exporting is itself a custody event: a copy leaving the system is
+    exactly what a chain of custody exists to record."""
     custody.append_entry(
         db,
         subject_type=custody.SUBJECT_EVIDENCE,
@@ -1679,48 +1706,72 @@ def export_check_report(
         event_type=custody.REPORT_EXPORTED,
         actor=auth.actor_from(user),
         payload={
-            "verdict": row.verdict,
-            "custody_entries": len(entries),
-            "chain_head": chain.get("head_hash"),
+            "verdict": report["check"]["verdict"],
+            "custody_entries": len(report["custody"]["entries"]),
+            "chain_head": report["custody"]["chain"].get("head_hash"),
+            "format": fmt,
         },
     )
     db.commit()
 
-    return {
-        "report": {
-            "generated_at": datetime.utcnow().isoformat() + "Z",
-            "generated_by": auth.actor_from(user),
-            "check": {
-                "id": str(row.id),
-                "sha256": row.sha256_hash,
-                "phash": row.phash,
-                "verdict": row.verdict,
-                "match_method": row.match_method,
-                "orb_inliers": row.orb_inliers,
-                "orb_inlier_ratio": (
-                    float(row.orb_inlier_ratio) if row.orb_inlier_ratio is not None else None
-                ),
-                "phash_distance": row.phash_distance,
-                "saved_filename": row.saved_filename,
-                "checked_at": row.created_at.isoformat() if row.created_at else None,
-                "matched_asset": (
-                    {
-                        "id": str(row.asset_id),
-                        "file_name": row.asset_name,
-                        "sha256": row.asset_sha256,
-                        "registered_at": (
-                            row.asset_registered_at.isoformat()
-                            if row.asset_registered_at
-                            else None
-                        ),
-                    }
-                    if row.asset_id
-                    else None
-                ),
-            },
-            "custody": {"chain": chain, "entries": entries},
-        }
-    }
+
+@app.post("/checks/{check_id}/report")
+def export_check_report(
+    check_id: str,
+    user: dict | None = Depends(auth.optional_user),
+    db: Session = Depends(get_db),
+):
+    """Produce a report for one check, and record that it was exported.
+
+    The report embeds the custody chain and its verification result, so the
+    document carries its own evidence of completeness instead of asserting it.
+    """
+    report = _gather_report(db, check_id, user)
+    _record_export(db, check_id, user, report, "json")
+    return {"report": report}
+
+
+@app.post("/checks/{check_id}/report.pdf")
+def export_check_report_pdf(
+    check_id: str,
+    user: dict | None = Depends(auth.optional_user),
+    db: Session = Depends(get_db),
+):
+    """The same report as a PDF, with the evidence image and the heatmap.
+
+    The PDF is rendered before the export is recorded, so a rendering failure
+    never leaves a custody entry claiming an export that did not happen.
+    """
+    report = _gather_report(db, check_id, user)
+    check = report["check"]
+    matched = check["matched_asset"]
+
+    try:
+        evidence_image, _ = _load_verified_evidence(check_id, db, user)
+    except HTTPException:
+        evidence_image = None  # missing, or failed its integrity check: said so in the PDF
+
+    overlay_image = None
+    if evidence_image and matched and check["verdict"] in ("TAMPERED_MANIPULATED", "EARLIER_ORIGINAL_EXISTS"):
+        try:
+            _, overlay_path = _build_difference_artifacts(check_id, matched["id"], db, user)
+            overlay_image = overlay_path.read_bytes() if overlay_path else None
+        except HTTPException:
+            overlay_image = None
+
+    anchor = blockchain.get_anchor(matched["sha256"]) if matched and matched.get("sha256") else None
+    pdf = report_pdf.render(
+        report, evidence_image, overlay_image, anchor, os.getenv("REGISTRY_CONTRACT_ADDRESS")
+    )
+
+    _record_export(db, check_id, user, report, "pdf")
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="forenscreen-report-{check_id[:8]}.pdf"'
+        },
+    )
 
 
 @app.get("/checks/{check_id}")
