@@ -110,34 +110,6 @@ class CustodyEntry(Base):
     )
 
 
-class Case(Base):
-    """One incident's evidence, grouped by its owner (FYP1 ERD: cases).
-
-    Cases are closed rather than deleted: the custody logs of the items in a
-    case refer to it, so it must keep existing for those records to make sense.
-    """
-
-    __tablename__ = "cases"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    owner = Column(String(128), nullable=False, index=True)
-    title = Column(String(120), nullable=False)
-    summary = Column(String(2000), nullable=True)
-    status = Column(String(16), nullable=False, default="open")  # 'open' | 'closed'
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-
-
-class CaseItem(Base):
-    """An original or a check placed in a case. Both must belong to the case's owner."""
-
-    __tablename__ = "case_items"
-
-    case_id = Column(UUID(as_uuid=True), ForeignKey("cases.id"), primary_key=True)
-    subject_type = Column(String(16), primary_key=True)  # 'asset' | 'evidence'
-    subject_id = Column(UUID(as_uuid=True), primary_key=True)
-    added_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-
-
 class ShareLink(Base):
     """A link the owner of a check gives to someone (police, a school) so they
     can see the result side by side with the original, without an account.

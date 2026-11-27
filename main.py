@@ -126,7 +126,7 @@ import metadata
 import report_pdf
 from database import SessionLocal, ensure_schema, get_db
 from models import (
-    Case, CaseItem, CustodyEntry, EvidenceCheck, ExtensionToken, OriginalAsset, ShareLink,
+    CustodyEntry, EvidenceCheck, ExtensionToken, OriginalAsset, ShareLink,
 )
 from pydantic import BaseModel
 
@@ -637,11 +637,10 @@ def _wider_candidates(
 @app.post("/upload")
 async def upload_evidence(
     file: UploadFile = File(...),
-    case_id: str = Form(None),
     submitter_metadata: str = Form(None),
     # Optional explicit scoping: if the caller already knows which registered
     # original this evidence should be verified against (e.g. selected from
-    # a case's asset list in the UI), pass its id here to bypass the
+    # the registry in the UI), pass its id here to bypass the
     # database-wide nearest-neighbor search entirely. This is the most
     # reliable fix for ambiguous pHash matches - prefer it when available.
     original_asset_id: str = Form(None),
@@ -654,14 +653,6 @@ async def upload_evidence(
     and cryptographic integrity checking using Approach A.
     """
     results = []
-
-    # A check run from inside a case is filed into it. Checked up front, so a
-    # bad case id fails before any work is done.
-    case = None
-    if case_id:
-        case = _require_case_owner(db, case_id, user)
-        if case.status != "open":
-            raise HTTPException(status_code=409, detail="This case is closed. Reopen it to add evidence.")
 
     # Parse submitter metadata if provided
     metadata = {}
@@ -951,7 +942,6 @@ async def upload_evidence(
             "size": len(file_content),
             "mime_type": file.content_type,
             "sha256_hash": sha256_hash,
-            "case_id": case_id,
             "uploaded_at": datetime.now().isoformat(),
             "verification_status": verification_status,  # AUTHENTIC, TAMPERED, or UNREGISTERED
             "matched_asset": matched_asset_info,          # Details of the original file it matched with
@@ -1007,8 +997,6 @@ async def upload_evidence(
                         "saved_filename": saved_filename,
                     },
                 )
-                if case is not None:
-                    _attach(db, case, custody.SUBJECT_EVIDENCE, file_id, user)
                 file_path.write_bytes(file_content)
                 db.commit()
                 file_result["persisted"] = True
@@ -1856,236 +1844,6 @@ def get_check(
         "saved_filename": row.saved_filename,
         "created_at": row.created_at.isoformat() if row.created_at else None,
     }
-
-
-# ---------------------------------------------------------------------------
-# Cases
-# ---------------------------------------------------------------------------
-# A case groups one incident's originals and checks (FYP1 ERD). Like everything
-# else it is visible to its owner only, and only the owner's own originals and
-# checks can be put in it. Adding or removing an item is recorded in that
-# item's custody log, so the log shows which incident the evidence was used in.
-# Cases are closed, never deleted, because those log entries refer to them.
-
-CASE_STATUSES = {"open", "closed"}
-
-
-class CaseFields(BaseModel):
-    title: str | None = None
-    summary: str | None = None
-    status: str | None = None
-
-
-class CaseItemRef(BaseModel):
-    subject_type: str
-    subject_id: str
-
-
-def _clean_case_fields(fields: CaseFields, creating: bool) -> dict:
-    values = {}
-    if fields.title is not None or creating:
-        title = (fields.title or "").strip()
-        if not 1 <= len(title) <= 120:
-            raise HTTPException(status_code=400, detail="A case needs a title of 1-120 characters.")
-        values["title"] = title
-    if fields.summary is not None:
-        summary = fields.summary.strip()
-        if len(summary) > 2000:
-            raise HTTPException(status_code=400, detail="The summary can be at most 2000 characters.")
-        values["summary"] = summary or None
-    if fields.status is not None:
-        if fields.status not in CASE_STATUSES:
-            raise HTTPException(status_code=400, detail="Status must be 'open' or 'closed'.")
-        values["status"] = fields.status
-    return values
-
-
-def _require_case_owner(db: Session, case_id: str, user: dict | None) -> Case:
-    _parse_uuid(case_id, "case id")
-    case = db.get(Case, uuid.UUID(case_id))
-    if case is None or case.owner != _owner(user):
-        raise HTTPException(status_code=404, detail="Case not found.")
-    return case
-
-
-def _require_owned_item(db: Session, subject_type: str, subject_id: str, user: dict) -> None:
-    """An item may go in a case only if the caller owns it."""
-    _validate_subject(subject_type, subject_id)
-    table = "original_assets" if subject_type == custody.SUBJECT_ASSET else "evidence_checks"
-    owner = db.execute(
-        text(f"SELECT owner FROM {table} WHERE id = :id"), {"id": subject_id}
-    ).scalar()
-    if owner is None or owner != _owner(user):
-        raise HTTPException(status_code=404, detail="Item not found.")
-
-
-def _attach(db: Session, case: Case, subject_type: str, subject_id: str, user: dict) -> bool:
-    """Put an item in a case and log it. False if it was already there."""
-    key = (case.id, subject_type, uuid.UUID(subject_id))
-    if db.get(CaseItem, key) is not None:
-        return False
-    db.add(CaseItem(case_id=case.id, subject_type=subject_type, subject_id=key[2]))
-    custody.append_entry(
-        db,
-        subject_type=subject_type,
-        subject_id=key[2],
-        event_type=custody.CASE_ATTACHED,
-        actor=auth.actor_from(user),
-        payload={"case_id": str(case.id), "case_title": case.title},
-    )
-    return True
-
-
-def _case_summary(case: Case, counts: dict | None = None) -> dict:
-    counts = counts or {}
-    return {
-        "id": str(case.id),
-        "title": case.title,
-        "summary": case.summary,
-        "status": case.status,
-        "created_at": case.created_at.isoformat() if case.created_at else None,
-        "originals": counts.get(custody.SUBJECT_ASSET, 0),
-        "checks": counts.get(custody.SUBJECT_EVIDENCE, 0),
-    }
-
-
-@app.get("/cases")
-def list_cases(user: dict = Depends(auth.require_user), db: Session = Depends(get_db)):
-    """The caller's cases, newest first, with how many items each holds."""
-    cases = (
-        db.query(Case).filter(Case.owner == _owner(user)).order_by(Case.created_at.desc()).all()
-    )
-    rows = db.execute(
-        text("""
-            SELECT i.case_id, i.subject_type, count(*) AS n
-            FROM case_items i JOIN cases c ON c.id = i.case_id
-            WHERE c.owner = :owner
-            GROUP BY i.case_id, i.subject_type
-        """),
-        {"owner": _owner(user)},
-    ).fetchall()
-    counts: dict = {}
-    for row in rows:
-        counts.setdefault(row.case_id, {})[row.subject_type] = row.n
-    return {"cases": [_case_summary(case, counts.get(case.id)) for case in cases]}
-
-
-@app.post("/cases", status_code=status.HTTP_201_CREATED)
-def create_case(
-    fields: CaseFields, user: dict = Depends(auth.require_user), db: Session = Depends(get_db)
-):
-    values = _clean_case_fields(fields, creating=True)
-    values.pop("status", None)  # a new case is always open
-    case = Case(owner=_owner(user), status="open", **values)
-    db.add(case)
-    db.commit()
-    db.refresh(case)
-    return _case_summary(case)
-
-
-@app.get("/cases/{case_id}")
-def get_case(case_id: str, user: dict = Depends(auth.require_user), db: Session = Depends(get_db)):
-    """One case with its items, oldest first."""
-    case = _require_case_owner(db, case_id, user)
-    assets = db.execute(
-        text("""
-            SELECT a.id, a.file_name, a.sha256_hash, a.created_at, i.added_at
-            FROM case_items i JOIN original_assets a ON a.id = i.subject_id
-            WHERE i.case_id = :case_id AND i.subject_type = 'asset'
-            ORDER BY i.added_at
-        """),
-        {"case_id": case_id},
-    ).fetchall()
-    checks = db.execute(
-        text("""
-            SELECT c.id, c.verdict, c.sha256_hash, c.created_at, i.added_at,
-                   CASE WHEN a.owner = :owner THEN a.file_name END AS asset_name
-            FROM case_items i
-            JOIN evidence_checks c ON c.id = i.subject_id
-            LEFT JOIN original_assets a ON a.id = c.asset_id
-            WHERE i.case_id = :case_id AND i.subject_type = 'evidence'
-            ORDER BY i.added_at
-        """),
-        {"case_id": case_id, "owner": _owner(user)},
-    ).fetchall()
-
-    def iso(value):
-        return value.isoformat() if value else None
-
-    return {
-        **_case_summary(case, {"asset": len(assets), "evidence": len(checks)}),
-        "items": {
-            "originals": [
-                {"id": str(r.id), "file_name": r.file_name, "sha256": r.sha256_hash,
-                 "registered_at": iso(r.created_at), "added_at": iso(r.added_at)}
-                for r in assets
-            ],
-            "checks": [
-                {"id": str(r.id), "verification_status": r.verdict, "sha256": r.sha256_hash,
-                 "matched_asset_name": r.asset_name, "checked_at": iso(r.created_at),
-                 "added_at": iso(r.added_at)}
-                for r in checks
-            ],
-        },
-    }
-
-
-@app.patch("/cases/{case_id}")
-def update_case(
-    case_id: str,
-    fields: CaseFields,
-    user: dict = Depends(auth.require_user),
-    db: Session = Depends(get_db),
-):
-    """Rename, re-describe, close or reopen a case."""
-    case = _require_case_owner(db, case_id, user)
-    for name, value in _clean_case_fields(fields, creating=False).items():
-        setattr(case, name, value)
-    db.commit()
-    db.refresh(case)
-    return _case_summary(case)
-
-
-@app.post("/cases/{case_id}/items")
-def add_case_item(
-    case_id: str,
-    item: CaseItemRef,
-    user: dict = Depends(auth.require_user),
-    db: Session = Depends(get_db),
-):
-    case = _require_case_owner(db, case_id, user)
-    if case.status != "open":
-        raise HTTPException(status_code=409, detail="This case is closed. Reopen it to add evidence.")
-    _require_owned_item(db, item.subject_type, item.subject_id, user)
-    added = _attach(db, case, item.subject_type, item.subject_id, user)
-    db.commit()
-    return {"added": added}
-
-
-@app.delete("/cases/{case_id}/items/{subject_type}/{subject_id}")
-def remove_case_item(
-    case_id: str,
-    subject_type: str,
-    subject_id: str,
-    user: dict = Depends(auth.require_user),
-    db: Session = Depends(get_db),
-):
-    case = _require_case_owner(db, case_id, user)
-    _validate_subject(subject_type, subject_id)
-    row = db.get(CaseItem, (case.id, subject_type, uuid.UUID(subject_id)))
-    if row is None:
-        raise HTTPException(status_code=404, detail="That item is not in this case.")
-    db.delete(row)
-    custody.append_entry(
-        db,
-        subject_type=subject_type,
-        subject_id=uuid.UUID(subject_id),
-        event_type=custody.CASE_DETACHED,
-        actor=auth.actor_from(user),
-        payload={"case_id": str(case.id), "case_title": case.title},
-    )
-    db.commit()
-    return {"removed": True}
 
 
 # ---------------------------------------------------------------------------
